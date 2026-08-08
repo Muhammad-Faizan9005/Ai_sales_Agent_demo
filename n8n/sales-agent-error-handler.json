@@ -1,0 +1,97 @@
+{
+  "name": "sales-agent-error-handler",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "b1000000-0000-4000-8000-000000000001",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [-100, 300],
+      "notes": "Fires whenever sales-agent-events throws. Set this workflow as the Error Workflow in that workflow's settings."
+    },
+    {
+      "parameters": {
+        "jsCode": "// The error trigger hands us the failed execution. Dig the session_id out of\n// the original webhook payload so the dashboard can tie the failure to a run.\n//\n// Shape: { execution: { id, url, error, lastNodeExecuted, ... }, workflow: { id, name } }\nconst e = $input.first().json;\n\nlet sessionId = null;\ntry {\n  const runData = e.execution?.data?.resultData?.runData ?? {};\n  const webhookRun = runData['Webhook']?.[0]?.data?.main?.[0]?.[0]?.json;\n  sessionId = webhookRun?.body?.session_id ?? null;\n} catch (_) {\n  // fall through — we still log the failure, just unattributed\n}\n\nconst node = e.execution?.lastNodeExecuted ?? 'unknown node';\nconst message = e.execution?.error?.message ?? 'unknown error';\n\nreturn [{\n  json: {\n    session_id: sessionId,\n    error_text: `[n8n:${e.workflow?.name ?? 'sales-agent-events'}] ${node} failed: ${message}`,\n    execution_url: e.execution?.url ?? null,\n  },\n}];"
+      },
+      "id": "b1000000-0000-4000-8000-000000000002",
+      "name": "Extract Failure Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [120, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "has-session",
+              "leftValue": "={{ $json.session_id }}",
+              "rightValue": "",
+              "operator": { "type": "string", "operation": "notEmpty", "singleValue": true }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "b1000000-0000-4000-8000-000000000003",
+      "name": "IF Session Known",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [340, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE agent_runs\n   SET error = $2\n WHERE session_id = $1",
+        "options": {
+          "queryReplacement": "={{ $json.session_id }},={{ $json.error_text }}"
+        }
+      },
+      "id": "b1000000-0000-4000-8000-000000000004",
+      "name": "Record Error on Run",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [560, 200],
+      "credentials": { "postgres": { "id": "REPLACE_PG_CRED_ID", "name": "Supabase Postgres" } },
+      "notes": "This is the row the dashboard reads for 'lead captured but CRM sync failed'. Without it, a silent failure looks identical to a success."
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $env.NOTIFY_FROM_EMAIL }}",
+        "toEmail": "={{ $env.OPS_ALERT_EMAIL }}",
+        "subject": "=[n8n] sales-agent-events failed",
+        "emailFormat": "text",
+        "text": "={{ $json.error_text }}\n\nSession: {{ $json.session_id || 'unattributed' }}\nExecution: {{ $json.execution_url }}",
+        "options": {}
+      },
+      "id": "b1000000-0000-4000-8000-000000000005",
+      "name": "Alert Ops",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [780, 300],
+      "credentials": { "smtp": { "id": "REPLACE_SMTP_CRED_ID", "name": "SMTP" } }
+    }
+  ],
+  "connections": {
+    "Error Trigger": { "main": [[{ "node": "Extract Failure Context", "type": "main", "index": 0 }]] },
+    "Extract Failure Context": { "main": [[{ "node": "IF Session Known", "type": "main", "index": 0 }]] },
+    "IF Session Known": {
+      "main": [
+        [{ "node": "Record Error on Run", "type": "main", "index": 0 }],
+        [{ "node": "Alert Ops", "type": "main", "index": 0 }]
+      ]
+    },
+    "Record Error on Run": { "main": [[{ "node": "Alert Ops", "type": "main", "index": 0 }]] }
+  },
+  "settings": { "executionOrder": "v1" },
+  "pinData": {},
+  "tags": []
+}

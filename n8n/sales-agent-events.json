@@ -1,0 +1,566 @@
+{
+  "name": "sales-agent-events",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "sales-agent",
+        "authentication": "headerAuth",
+        "responseMode": "onReceived",
+        "responseData": "allEntries",
+        "options": {}
+      },
+      "id": "a1000000-0000-4000-8000-000000000001",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-160, 340],
+      "webhookId": "sales-agent-events",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_HEADER_AUTH_CRED_ID",
+          "name": "Sales Agent Webhook Secret"
+        }
+      },
+      "notes": "Header Auth credential = the value your app sends as N8N_WEBHOOK_SECRET. responseMode onReceived returns 200 immediately so the chat turn never waits."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.AUTOCRM_BASE_URL }}/api/auth/login",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ email: $env.AUTOCRM_SERVICE_EMAIL, password: $env.AUTOCRM_SERVICE_PASSWORD }) }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": false
+            }
+          },
+          "timeout": 15000
+        }
+      },
+      "id": "a1000000-0000-4000-8000-000000000002",
+      "name": "AutoCRM Login",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [60, 340],
+      "notes": "AutoCRM is cookie-auth only for these routes. fullResponse:true is REQUIRED so we can read set-cookie. Login is CSRF-exempt (app/auth/cookies.py _CSRF_EXEMPT_PATHS). CHECKED: /api/leads/ingest does NOT accept X-AI-Service-Token -- it is Depends(require_auth), and the service token only works on /api/agent/*. So this node stays. See README s1.1 for why swapping the backend dependency is not the one-word fix it looks like."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse the Set-Cookie array from AutoCRM's login response into the two\n// values every later request needs: the access_token cookie and the\n// csrf_token, which must ALSO be echoed as an X-CSRF-Token header on\n// POST/PATCH/DELETE (API.md s3, \"double-submit CSRF\").\nconst res = $input.first().json;\nconst raw = res.headers?.['set-cookie'] ?? [];\nconst list = Array.isArray(raw) ? raw : [raw];\n\nconst jar = {};\nfor (const entry of list) {\n  const [pair] = String(entry).split(';');\n  const eq = pair.indexOf('=');\n  if (eq === -1) continue;\n  jar[pair.slice(0, eq).trim()] = pair.slice(eq + 1).trim();\n}\n\nif (!jar.access_token) {\n  throw new Error('AutoCRM login returned no access_token cookie. Check AUTOCRM_SERVICE_EMAIL / AUTOCRM_SERVICE_PASSWORD and that the user is_active.');\n}\n\nreturn [{\n  json: {\n    cookieHeader: `access_token=${jar.access_token}; csrf_token=${jar.csrf_token ?? ''}`,\n    csrfToken: jar.csrf_token ?? '',\n  },\n}];"
+      },
+      "id": "a1000000-0000-4000-8000-000000000003",
+      "name": "Extract Cookies",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [280, 340],
+      "notes": "Access token TTL is 30 min (default). We log in per execution rather than caching, so TTL never matters."
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "sw-lead",
+                    "leftValue": "={{ $('Webhook').item.json.body.event_type }}",
+                    "rightValue": "lead_created",
+                    "operator": { "type": "string", "operation": "equals" }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "lead_created"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "sw-meeting",
+                    "leftValue": "={{ $('Webhook').item.json.body.event_type }}",
+                    "rightValue": "meeting_booked",
+                    "operator": { "type": "string", "operation": "equals" }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "meeting_booked"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "sw-proposal",
+                    "leftValue": "={{ $('Webhook').item.json.body.event_type }}",
+                    "rightValue": "proposal_requested",
+                    "operator": { "type": "string", "operation": "equals" }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "proposal_requested"
+            }
+          ]
+        },
+        "options": { "fallbackOutput": "extra" }
+      },
+      "id": "a1000000-0000-4000-8000-000000000004",
+      "name": "Switch Event",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [500, 340],
+      "notes": "No high_value_lead output on purpose. Urgency is a branch INSIDE lead_created (see IF Hot Lead) so a hot lead never creates two CRM records."
+    },
+
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT crm_lead_id\n  FROM agent_runs\n WHERE session_id = $1",
+        "options": {
+          "queryReplacement": "={{ $('Webhook').item.json.body.session_id }}"
+        }
+      },
+      "id": "a1000000-0000-4000-8000-000000000010",
+      "name": "Check Existing Sync",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [740, 40],
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": { "id": "REPLACE_PG_CRED_ID", "name": "Supabase Postgres" }
+      },
+      "notes": "Idempotency guard. The widget rehydrates on every WordPress page load, so the same session can emit lead_created more than once."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "if-not-synced",
+              "leftValue": "={{ $json.crm_lead_id }}",
+              "rightValue": "",
+              "operator": { "type": "string", "operation": "empty", "singleValue": true }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "a1000000-0000-4000-8000-000000000011",
+      "name": "IF Not Synced",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [960, 40]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.AUTOCRM_BASE_URL }}/api/leads/ingest",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Cookie", "value": "={{ $('Extract Cookies').item.json.cookieHeader }}" },
+            { "name": "X-CSRF-Token", "value": "={{ $('Extract Cookies').item.json.csrfToken }}" },
+            { "name": "X-Request-ID", "value": "={{ 'n8n-lead-' + $('Webhook').item.json.body.session_id }}" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  full_name: $('Webhook').item.json.body.fields.visitor_name,\n  email: $('Webhook').item.json.body.fields.visitor_email,\n  phone: $('Webhook').item.json.body.fields.visitor_phone,\n  company: $('Webhook').item.json.body.fields.company_name,\n  source: 'website_ai_agent',\n  status: 'new',\n  notes: ('AI sales agent conversation.\\n\\nScore: ' + ($('Webhook').item.json.body.score ?? 'n/a') + '\\nService discussed: ' + ($('Webhook').item.json.body.fields.service_recommended ?? 'n/a') + '\\nPages walked: ' + JSON.stringify($('Webhook').item.json.body.pages_visited ?? []) + '\\n\\nTranscript:\\n' + ($('Webhook').item.json.body.transcript_text ?? '')).slice(0, 4500)\n}) }}",
+        "options": { "timeout": 20000 }
+      },
+      "id": "a1000000-0000-4000-8000-000000000012",
+      "name": "Upsert AutoCRM Lead",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1180, 40],
+      "notes": "VERIFIED against backend source (app/services/import_service.py:286). /api/leads/ingest, NOT /api/leads/ -- ingest_lead_payload() accepts full_name as an alias for name, UPSERTS by email, auto-creates the organization from company, and turns a `notes` key into a lead note. That is why this single call replaces the old Create Lead + Attach Note pair. Note insert dedupes on exact content, so a replayed webhook writes nothing. Do NOT send `score`: LeadCreate.score is int 0-100, not 'hot'/'warm'/'cold', and the backend recalculates it anyway. status must be one of new/contacted/nurture/qualified/unqualified/junk (app/utils/statuses.py). No trailing slash on this path."
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": { "__rl": true, "value": "REPLACE_SHEET_ID", "mode": "id" },
+        "sheetName": { "__rl": true, "value": "Leads", "mode": "name" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "captured_at": "={{ $now.toISO() }}",
+            "session_id": "={{ $('Webhook').item.json.body.session_id }}",
+            "name": "={{ $('Webhook').item.json.body.fields.visitor_name }}",
+            "email": "={{ $('Webhook').item.json.body.fields.visitor_email }}",
+            "phone": "={{ $('Webhook').item.json.body.fields.visitor_phone }}",
+            "company": "={{ $('Webhook').item.json.body.fields.company_name }}",
+            "service": "={{ $('Webhook').item.json.body.fields.service_recommended }}",
+            "score": "={{ $('Webhook').item.json.body.score }}",
+            "crm_lead_id": "={{ $('Upsert AutoCRM Lead').item.json.id }}"
+          },
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "a1000000-0000-4000-8000-000000000014",
+      "name": "Append to Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [1620, 40],
+      "credentials": {
+        "googleSheetsOAuth2Api": { "id": "REPLACE_SHEETS_CRED_ID", "name": "Google Sheets" }
+      },
+      "onError": "continueRegularOutput",
+      "notes": "onError=continue: a Sheets failure must not block the CRM write-back downstream."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "if-hot",
+              "leftValue": "={{ $('Webhook').item.json.body.score }}",
+              "rightValue": "hot",
+              "operator": { "type": "string", "operation": "equals" }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "a1000000-0000-4000-8000-000000000015",
+      "name": "IF Hot Lead",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [1840, 40],
+      "notes": "This is the old high_value_lead event, folded in. Score is computed deterministically in code (plan s8) - not by the model."
+    },
+    {
+      "parameters": {
+        "operation": "send",
+        "phoneNumberId": "={{ $env.WHATSAPP_PHONE_NUMBER_ID }}",
+        "recipientPhoneNumber": "={{ $env.SALES_LEAD_WHATSAPP }}",
+        "textBody": "=HOT LEAD from the website agent\n\n{{ $('Webhook').item.json.body.fields.visitor_name }} — {{ $('Webhook').item.json.body.fields.company_name }}\n{{ $('Webhook').item.json.body.fields.visitor_email }} / {{ $('Webhook').item.json.body.fields.visitor_phone }}\nInterested in: {{ $('Webhook').item.json.body.fields.service_recommended }}\n\nCRM: {{ $env.AUTOCRM_BASE_URL }}/leads/{{ $('Upsert AutoCRM Lead').item.json.id }}",
+        "additionalFields": {}
+      },
+      "id": "a1000000-0000-4000-8000-000000000016",
+      "name": "WhatsApp Hot Alert",
+      "type": "n8n-nodes-base.whatsApp",
+      "typeVersion": 1,
+      "position": [2060, -60],
+      "credentials": {
+        "whatsAppApi": { "id": "REPLACE_WHATSAPP_CRED_ID", "name": "WhatsApp Cloud API" }
+      },
+      "onError": "continueRegularOutput",
+      "notes": "WhatsApp Cloud API only allows free-form text inside a 24h customer-service window. Outbound-initiated alerts to your own reps need an approved message TEMPLATE. See README s6."
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $env.NOTIFY_FROM_EMAIL }}",
+        "toEmail": "={{ $env.SALES_TEAM_EMAIL }}",
+        "subject": "=New {{ $('Webhook').item.json.body.score }} lead — {{ $('Webhook').item.json.body.fields.company_name || $('Webhook').item.json.body.fields.visitor_name }}",
+        "emailFormat": "text",
+        "text": "=A visitor qualified through the AI sales agent.\n\nName:    {{ $('Webhook').item.json.body.fields.visitor_name }}\nEmail:   {{ $('Webhook').item.json.body.fields.visitor_email }}\nPhone:   {{ $('Webhook').item.json.body.fields.visitor_phone }}\nCompany: {{ $('Webhook').item.json.body.fields.company_name }}\nService: {{ $('Webhook').item.json.body.fields.service_recommended }}\nScore:   {{ $('Webhook').item.json.body.score }}\n\nPages the agent walked them through:\n{{ JSON.stringify($('Webhook').item.json.body.pages_visited ?? []) }}\n\nAutoCRM lead: {{ $env.AUTOCRM_BASE_URL }}/leads/{{ $('Upsert AutoCRM Lead').item.json.id }}\nSession: {{ $('Webhook').item.json.body.session_id }}",
+        "options": {}
+      },
+      "id": "a1000000-0000-4000-8000-000000000017",
+      "name": "Notify Rep (Email)",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [2060, 140],
+      "credentials": {
+        "smtp": { "id": "REPLACE_SMTP_CRED_ID", "name": "SMTP" }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE agent_runs\n   SET crm_lead_id       = $2,\n       crm_synced        = true,\n       sheets_synced     = true,\n       notification_sent = true\n WHERE session_id = $1",
+        "options": {
+          "queryReplacement": "={{ $('Webhook').item.json.body.session_id }},={{ $('Upsert AutoCRM Lead').item.json.id }}"
+        }
+      },
+      "id": "a1000000-0000-4000-8000-000000000018",
+      "name": "Write Back (lead_created)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [2280, 40],
+      "credentials": {
+        "postgres": { "id": "REPLACE_PG_CRED_ID", "name": "Supabase Postgres" }
+      },
+      "notes": "This is what makes the dashboard's 'captured but not synced' panel real. Plan s9/s10."
+    },
+
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT crm_lead_id, visitor_name, visitor_email\n  FROM agent_runs\n WHERE session_id = $1",
+        "options": {
+          "queryReplacement": "={{ $('Webhook').item.json.body.session_id }}"
+        }
+      },
+      "id": "a1000000-0000-4000-8000-000000000020",
+      "name": "Lookup Lead (meeting)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [740, 340],
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": { "id": "REPLACE_PG_CRED_ID", "name": "Supabase Postgres" }
+      }
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $env.AUTOCRM_BASE_URL }}/api/leads/{{ $json.crm_lead_id }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Cookie", "value": "={{ $('Extract Cookies').item.json.cookieHeader }}" },
+            { "name": "X-CSRF-Token", "value": "={{ $('Extract Cookies').item.json.csrfToken }}" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ status: 'qualified' }) }}",
+        "options": { "timeout": 20000 }
+      },
+      "id": "a1000000-0000-4000-8000-000000000021",
+      "name": "Update Lead Status",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [960, 340],
+      "notes": "CORRECTED: lead status is NOT free text. app/routers/leads.py runs normalize_status() against LEAD_STATUSES = {new, contacted, nurture, qualified, unqualified, junk}; the old 'meeting_scheduled' returned 422. 'qualified' is the closest true state for a booked discovery call. STILL OPEN: AutoCRM's real qualification step is POST /api/leads/{id}/convert-to-deal, which also creates a deal -- but that needs a deal `value` a website chat cannot produce. Leaving it as a status update so a human sets the number after the call. See README s7."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.AUTOCRM_BASE_URL }}/api/tasks/",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Cookie", "value": "={{ $('Extract Cookies').item.json.cookieHeader }}" },
+            { "name": "X-CSRF-Token", "value": "={{ $('Extract Cookies').item.json.csrfToken }}" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  title: 'Prep for discovery call — ' + ($('Webhook').item.json.body.fields.company_name ?? $('Webhook').item.json.body.fields.visitor_name ?? 'website lead'),\n  description: 'Booked via the AI sales agent for ' + $('Webhook').item.json.body.meeting.start_time + '. Reschedule: ' + ($('Webhook').item.json.body.meeting.reschedule_url ?? 'n/a'),\n  entity_type: 'lead',\n  entity_id: $('Lookup Lead (meeting)').item.json.crm_lead_id,\n  status: 'open',\n  priority: 'high'\n}) }}",
+        "options": { "timeout": 20000 }
+      },
+      "id": "a1000000-0000-4000-8000-000000000022",
+      "name": "Create Prep Task",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1180, 340],
+      "notes": "!! VERIFY THE BODY SCHEMA against /openapi.json. API.md s8.11 documents filters, not TaskCreate fields. AutoCRM has no documented POST for notifications, so a task is the way to put something in front of a rep."
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $env.NOTIFY_FROM_EMAIL }}",
+        "toEmail": "={{ $env.SALES_TEAM_EMAIL }}",
+        "subject": "=Meeting booked — {{ $('Webhook').item.json.body.fields.visitor_name }}",
+        "emailFormat": "text",
+        "text": "=The AI sales agent booked a meeting.\n\nWhen:    {{ $('Webhook').item.json.body.meeting.start_time }}\nWith:    {{ $('Webhook').item.json.body.fields.visitor_name }} ({{ $('Webhook').item.json.body.fields.visitor_email }})\nCompany: {{ $('Webhook').item.json.body.fields.company_name }}\n\nReschedule: {{ $('Webhook').item.json.body.meeting.reschedule_url }}\nCancel:     {{ $('Webhook').item.json.body.meeting.cancel_url }}\n\nAutoCRM lead: {{ $env.AUTOCRM_BASE_URL }}/leads/{{ $('Lookup Lead (meeting)').item.json.crm_lead_id }}",
+        "options": {}
+      },
+      "id": "a1000000-0000-4000-8000-000000000023",
+      "name": "Notify Rep (meeting)",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [1400, 340],
+      "credentials": { "smtp": { "id": "REPLACE_SMTP_CRED_ID", "name": "SMTP" } },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE agent_runs\n   SET meeting_booked    = true,\n       notification_sent = true\n WHERE session_id = $1",
+        "options": {
+          "queryReplacement": "={{ $('Webhook').item.json.body.session_id }}"
+        }
+      },
+      "id": "a1000000-0000-4000-8000-000000000024",
+      "name": "Write Back (meeting)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1620, 340],
+      "credentials": { "postgres": { "id": "REPLACE_PG_CRED_ID", "name": "Supabase Postgres" } }
+    },
+
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT crm_lead_id, visitor_name, visitor_email\n  FROM agent_runs\n WHERE session_id = $1",
+        "options": {
+          "queryReplacement": "={{ $('Webhook').item.json.body.session_id }}"
+        }
+      },
+      "id": "a1000000-0000-4000-8000-000000000030",
+      "name": "Lookup Lead (proposal)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [740, 640],
+      "alwaysOutputData": true,
+      "credentials": { "postgres": { "id": "REPLACE_PG_CRED_ID", "name": "Supabase Postgres" } }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.AUTOCRM_BASE_URL }}/api/tasks/",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Cookie", "value": "={{ $('Extract Cookies').item.json.cookieHeader }}" },
+            { "name": "X-CSRF-Token", "value": "={{ $('Extract Cookies').item.json.csrfToken }}" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  title: 'Send proposal — ' + ($('Webhook').item.json.body.fields.company_name ?? $('Webhook').item.json.body.fields.visitor_name ?? 'website lead'),\n  description: 'Requested via the AI sales agent. Service interest: ' + ($('Webhook').item.json.body.fields.service_recommended ?? 'unspecified'),\n  entity_type: 'lead',\n  entity_id: $json.crm_lead_id,\n  status: 'open',\n  priority: 'high'\n}) }}",
+        "options": { "timeout": 20000 }
+      },
+      "id": "a1000000-0000-4000-8000-000000000031",
+      "name": "Create Follow-up Task",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [960, 640],
+      "notes": "!! VERIFY THE BODY SCHEMA against /openapi.json."
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $env.NOTIFY_FROM_EMAIL }}",
+        "toEmail": "={{ $env.SALES_TEAM_EMAIL }}",
+        "subject": "=Proposal requested — {{ $('Webhook').item.json.body.fields.company_name || $('Webhook').item.json.body.fields.visitor_name }}",
+        "emailFormat": "text",
+        "text": "=A visitor requested a proposal through the AI sales agent.\n\nName:    {{ $('Webhook').item.json.body.fields.visitor_name }}\nEmail:   {{ $('Webhook').item.json.body.fields.visitor_email }}\nPhone:   {{ $('Webhook').item.json.body.fields.visitor_phone }}\nCompany: {{ $('Webhook').item.json.body.fields.company_name }}\nService: {{ $('Webhook').item.json.body.fields.service_recommended }}\n\nAutoCRM lead: {{ $env.AUTOCRM_BASE_URL }}/leads/{{ $('Lookup Lead (proposal)').item.json.crm_lead_id }}\nA follow-up task has been created on the lead.",
+        "options": {}
+      },
+      "id": "a1000000-0000-4000-8000-000000000032",
+      "name": "Notify Rep (proposal)",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [1180, 640],
+      "credentials": { "smtp": { "id": "REPLACE_SMTP_CRED_ID", "name": "SMTP" } },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE agent_runs\n   SET proposal_requested = true,\n       notification_sent  = true\n WHERE session_id = $1",
+        "options": {
+          "queryReplacement": "={{ $('Webhook').item.json.body.session_id }}"
+        }
+      },
+      "id": "a1000000-0000-4000-8000-000000000033",
+      "name": "Write Back (proposal)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1400, 640],
+      "credentials": { "postgres": { "id": "REPLACE_PG_CRED_ID", "name": "Supabase Postgres" } }
+    },
+
+    {
+      "parameters": {},
+      "id": "a1000000-0000-4000-8000-000000000040",
+      "name": "Unknown Event",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [740, 860],
+      "notes": "Fallback output. Keeps an unrecognised event_type visible in the execution log instead of silently vanishing."
+    },
+    {
+      "parameters": {},
+      "id": "a1000000-0000-4000-8000-000000000041",
+      "name": "Already Synced",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [1180, 200],
+      "notes": "Duplicate lead_created for a session that already has a crm_lead_id. Stop here."
+    }
+  ],
+  "connections": {
+    "Webhook": { "main": [[{ "node": "AutoCRM Login", "type": "main", "index": 0 }]] },
+    "AutoCRM Login": { "main": [[{ "node": "Extract Cookies", "type": "main", "index": 0 }]] },
+    "Extract Cookies": { "main": [[{ "node": "Switch Event", "type": "main", "index": 0 }]] },
+    "Switch Event": {
+      "main": [
+        [{ "node": "Check Existing Sync", "type": "main", "index": 0 }],
+        [{ "node": "Lookup Lead (meeting)", "type": "main", "index": 0 }],
+        [{ "node": "Lookup Lead (proposal)", "type": "main", "index": 0 }],
+        [{ "node": "Unknown Event", "type": "main", "index": 0 }]
+      ]
+    },
+
+    "Check Existing Sync": { "main": [[{ "node": "IF Not Synced", "type": "main", "index": 0 }]] },
+    "IF Not Synced": {
+      "main": [
+        [{ "node": "Upsert AutoCRM Lead", "type": "main", "index": 0 }],
+        [{ "node": "Already Synced", "type": "main", "index": 0 }]
+      ]
+    },
+    "Upsert AutoCRM Lead": { "main": [[{ "node": "Append to Sheets", "type": "main", "index": 0 }]] },
+    "Append to Sheets": { "main": [[{ "node": "IF Hot Lead", "type": "main", "index": 0 }]] },
+    "IF Hot Lead": {
+      "main": [
+        [{ "node": "WhatsApp Hot Alert", "type": "main", "index": 0 }],
+        [{ "node": "Notify Rep (Email)", "type": "main", "index": 0 }]
+      ]
+    },
+    "WhatsApp Hot Alert": { "main": [[{ "node": "Notify Rep (Email)", "type": "main", "index": 0 }]] },
+    "Notify Rep (Email)": { "main": [[{ "node": "Write Back (lead_created)", "type": "main", "index": 0 }]] },
+
+    "Lookup Lead (meeting)": { "main": [[{ "node": "Update Lead Status", "type": "main", "index": 0 }]] },
+    "Update Lead Status": { "main": [[{ "node": "Create Prep Task", "type": "main", "index": 0 }]] },
+    "Create Prep Task": { "main": [[{ "node": "Notify Rep (meeting)", "type": "main", "index": 0 }]] },
+    "Notify Rep (meeting)": { "main": [[{ "node": "Write Back (meeting)", "type": "main", "index": 0 }]] },
+
+    "Lookup Lead (proposal)": { "main": [[{ "node": "Create Follow-up Task", "type": "main", "index": 0 }]] },
+    "Create Follow-up Task": { "main": [[{ "node": "Notify Rep (proposal)", "type": "main", "index": 0 }]] },
+    "Notify Rep (proposal)": { "main": [[{ "node": "Write Back (proposal)", "type": "main", "index": 0 }]] }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "saveExecutionProgress": true,
+    "errorWorkflow": "REPLACE_ERROR_WORKFLOW_ID"
+  },
+  "pinData": {},
+  "tags": []
+}

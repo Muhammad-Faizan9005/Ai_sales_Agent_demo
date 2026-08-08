@@ -1,0 +1,107 @@
+{
+  "name": "faq-clustering-nightly",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            { "field": "cronExpression", "expression": "17 2 * * *" }
+          ]
+        }
+      },
+      "id": "c1000000-0000-4000-8000-000000000001",
+      "name": "Nightly 02:17",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [-100, 300],
+      "notes": "02:17 rather than 02:00 on purpose — everyone's cron lands on the hour, including Anthropic's other callers."
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT transcript\n  FROM agent_runs\n WHERE started_at > now() - interval '7 days'\n   AND transcript IS NOT NULL\n ORDER BY started_at DESC\n LIMIT 300",
+        "options": {}
+      },
+      "id": "c1000000-0000-4000-8000-000000000002",
+      "name": "Fetch Recent Transcripts",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [120, 300],
+      "credentials": { "postgres": { "id": "REPLACE_PG_CRED_ID", "name": "Supabase Postgres" } },
+      "notes": "LIMIT 300 keeps the prompt bounded. Raise it once you know your real volume and token cost."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Flatten every run's transcript down to visitor turns only. The agent's own\n// replies are noise for FAQ clustering — we want what people ASKED.\nconst questions = [];\n\nfor (const item of $input.all()) {\n  const transcript = item.json.transcript;\n  if (!Array.isArray(transcript)) continue;\n  for (const turn of transcript) {\n    if (turn?.role !== 'user') continue;\n    const text = String(turn.content ?? '').trim();\n    if (text.length < 8 || text.length > 400) continue;\n    questions.push(text);\n  }\n}\n\nif (questions.length === 0) {\n  return [];  // nothing to cluster; downstream nodes are skipped\n}\n\nreturn [{ json: { count: questions.length, corpus: questions.join('\\n---\\n') } }];"
+      },
+      "id": "c1000000-0000-4000-8000-000000000003",
+      "name": "Extract Visitor Questions",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [340, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "x-api-key", "value": "={{ $env.ANTHROPIC_API_KEY }}" },
+            { "name": "anthropic-version", "value": "2023-06-01" },
+            { "name": "content-type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  model: 'claude-opus-5',\n  max_tokens: 4096,\n  output_config: {\n    effort: 'low',\n    format: {\n      type: 'json_schema',\n      schema: {\n        type: 'object',\n        properties: {\n          faqs: {\n            type: 'array',\n            items: {\n              type: 'object',\n              properties: {\n                question: { type: 'string' },\n                frequency: { type: 'integer' }\n              },\n              required: ['question', 'frequency'],\n              additionalProperties: false\n            }\n          }\n        },\n        required: ['faqs'],\n        additionalProperties: false\n      }\n    }\n  },\n  messages: [{\n    role: 'user',\n    content: 'Below are visitor questions from an IT services company website chat, one per block, separated by ---. Cluster them into at most 15 distinct recurring questions. For each cluster write the question in the clearest neutral phrasing a visitor would recognise, and set frequency to how many raw questions fall into that cluster. Drop one-off questions that appear only once. Do not invent questions that are not represented in the input.\\n\\n' + $json.corpus\n  }]\n}) }}",
+        "options": { "timeout": 120000 }
+      },
+      "id": "c1000000-0000-4000-8000-000000000004",
+      "name": "Cluster via Claude",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [560, 300],
+      "notes": "One call for the whole batch, not one per transcript — that is what keeps this a rounding error on cost. output_config.format guarantees parseable JSON, so no retry-on-parse loop is needed."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Structured outputs guarantee the first text block is valid JSON matching the\n// schema — so a plain parse is safe here, no defensive retry needed.\nconst res = $input.first().json;\n\nif (res.stop_reason === 'refusal') {\n  throw new Error('Clustering call was refused: ' + JSON.stringify(res.stop_details ?? {}));\n}\n\nconst textBlock = (res.content ?? []).find((b) => b.type === 'text');\nif (!textBlock) throw new Error('No text block in the model response.');\n\nconst { faqs } = JSON.parse(textBlock.text);\n\nreturn faqs.map((f) => ({ json: { question: f.question, frequency: f.frequency } }));"
+      },
+      "id": "c1000000-0000-4000-8000-000000000005",
+      "name": "Parse Clusters",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [780, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO faq_summary (question, frequency, last_seen_at)\nVALUES ($1, $2, now())\nON CONFLICT (question)\nDO UPDATE SET frequency    = faq_summary.frequency + EXCLUDED.frequency,\n              last_seen_at = now()",
+        "options": {
+          "queryReplacement": "={{ $json.question }},={{ $json.frequency }}"
+        }
+      },
+      "id": "c1000000-0000-4000-8000-000000000006",
+      "name": "Upsert faq_summary",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1000, 300],
+      "credentials": { "postgres": { "id": "REPLACE_PG_CRED_ID", "name": "Supabase Postgres" } },
+      "notes": "REQUIRES a unique index the v1 DDL does not have:\n  CREATE UNIQUE INDEX faq_summary_question_key ON faq_summary (question);\nWithout it, ON CONFLICT throws and every night inserts duplicate rows."
+    }
+  ],
+  "connections": {
+    "Nightly 02:17": { "main": [[{ "node": "Fetch Recent Transcripts", "type": "main", "index": 0 }]] },
+    "Fetch Recent Transcripts": { "main": [[{ "node": "Extract Visitor Questions", "type": "main", "index": 0 }]] },
+    "Extract Visitor Questions": { "main": [[{ "node": "Cluster via Claude", "type": "main", "index": 0 }]] },
+    "Cluster via Claude": { "main": [[{ "node": "Parse Clusters", "type": "main", "index": 0 }]] },
+    "Parse Clusters": { "main": [[{ "node": "Upsert faq_summary", "type": "main", "index": 0 }]] }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "REPLACE_ERROR_WORKFLOW_ID"
+  },
+  "pinData": {},
+  "tags": []
+}
