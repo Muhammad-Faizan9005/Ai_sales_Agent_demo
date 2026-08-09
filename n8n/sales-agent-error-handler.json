@@ -34,7 +34,11 @@
               "id": "has-session",
               "leftValue": "={{ $json.session_id }}",
               "rightValue": "",
-              "operator": { "type": "string", "operation": "notEmpty", "singleValue": true }
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty",
+                "singleValue": true
+              }
             }
           ],
           "combinator": "and"
@@ -49,19 +53,33 @@
     },
     {
       "parameters": {
-        "operation": "executeQuery",
-        "query": "UPDATE agent_runs\n   SET error = $2\n WHERE session_id = $1",
+        "method": "POST",
+        "url": "={{ $credentials.host }}/rest/v1/rpc/record_run_error",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "supabaseApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ p_session_id: $json.session_id, p_error: $json.error_text }) }}",
         "options": {
-          "queryReplacement": "={{ $json.session_id }},={{ $json.error_text }}"
+          "timeout": 15000
         }
       },
-      "id": "b1000000-0000-4000-8000-000000000004",
       "name": "Record Error on Run",
-      "type": "n8n-nodes-base.postgres",
-      "typeVersion": 2.5,
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "credentials": {
+        "supabaseApi": {
+          "id": "REPLACE_SUPABASE_CRED_ID",
+          "name": "AI Sales Agent Supabase"
+        }
+      },
+      "notes": "Shares record_run_error with the events workflow.",
+      "id": "b1000000-0000-4000-8000-000000000004",
       "position": [560, 200],
-      "credentials": { "postgres": { "id": "REPLACE_PG_CRED_ID", "name": "Supabase Postgres" } },
-      "notes": "This is the row the dashboard reads for 'lead captured but CRM sync failed'. Without it, a silent failure looks identical to a success."
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
     },
     {
       "parameters": {
@@ -77,21 +95,53 @@
       "type": "n8n-nodes-base.emailSend",
       "typeVersion": 2.1,
       "position": [780, 300],
-      "credentials": { "smtp": { "id": "REPLACE_SMTP_CRED_ID", "name": "SMTP" } }
+      "credentials": {
+        "smtp": {
+          "id": "REPLACE_SMTP_CRED_ID",
+          "name": "SMTP"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
     }
   ],
   "connections": {
-    "Error Trigger": { "main": [[{ "node": "Extract Failure Context", "type": "main", "index": 0 }]] },
-    "Extract Failure Context": { "main": [[{ "node": "IF Session Known", "type": "main", "index": 0 }]] },
-    "IF Session Known": {
+    "Error Trigger": {
       "main": [
-        [{ "node": "Record Error on Run", "type": "main", "index": 0 }],
-        [{ "node": "Alert Ops", "type": "main", "index": 0 }]
+        [
+          { "node": "Extract Failure Context", "type": "main", "index": 0 }
+        ]
       ]
     },
-    "Record Error on Run": { "main": [[{ "node": "Alert Ops", "type": "main", "index": 0 }]] }
+    "Extract Failure Context": {
+      "main": [
+        [
+          { "node": "IF Session Known", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "IF Session Known": {
+      "main": [
+        [
+          { "node": "Record Error on Run", "type": "main", "index": 0 }
+        ],
+        [
+          { "node": "Alert Ops", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Record Error on Run": {
+      "main": [
+        [
+          { "node": "Alert Ops", "type": "main", "index": 0 }
+        ]
+      ]
+    }
   },
-  "settings": { "executionOrder": "v1" },
+  "settings": {
+    "executionOrder": "v1"
+  },
   "pinData": {},
   "tags": []
 }

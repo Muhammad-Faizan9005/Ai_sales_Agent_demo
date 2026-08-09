@@ -5,7 +5,10 @@
       "parameters": {
         "rule": {
           "interval": [
-            { "field": "cronExpression", "expression": "17 2 * * *" }
+            {
+              "field": "cronExpression",
+              "expression": "17 2 * * *"
+            }
           ]
         }
       },
@@ -18,16 +21,30 @@
     },
     {
       "parameters": {
-        "operation": "executeQuery",
-        "query": "SELECT transcript\n  FROM agent_runs\n WHERE started_at > now() - interval '7 days'\n   AND transcript IS NOT NULL\n ORDER BY started_at DESC\n LIMIT 300",
-        "options": {}
+        "operation": "getAll",
+        "tableId": "agent_runs",
+        "returnAll": false,
+        "limit": 300,
+        "filterType": "string",
+        "filterString": "=started_at=gt.{{ new Date(Date.now() - 7*24*60*60*1000).toISOString() }}&transcript=not.is.null&order=started_at.desc",
+        "options": {
+          "select": "transcript"
+        }
+      },
+      "name": "Fetch Recent Transcripts",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "credentials": {
+        "supabaseApi": {
+          "id": "REPLACE_SUPABASE_CRED_ID",
+          "name": "AI Sales Agent Supabase"
+        }
       },
       "id": "c1000000-0000-4000-8000-000000000002",
-      "name": "Fetch Recent Transcripts",
-      "type": "n8n-nodes-base.postgres",
-      "typeVersion": 2.5,
       "position": [120, 300],
-      "credentials": { "postgres": { "id": "REPLACE_PG_CRED_ID", "name": "Supabase Postgres" } },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
       "notes": "LIMIT 300 keeps the prompt bounded. Raise it once you know your real volume and token cost."
     },
     {
@@ -47,22 +64,36 @@
         "sendHeaders": true,
         "headerParameters": {
           "parameters": [
-            { "name": "x-api-key", "value": "={{ $env.ANTHROPIC_API_KEY }}" },
-            { "name": "anthropic-version", "value": "2023-06-01" },
-            { "name": "content-type", "value": "application/json" }
+            {
+              "name": "x-api-key",
+              "value": "={{ $env.ANTHROPIC_API_KEY }}"
+            },
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            },
+            {
+              "name": "content-type",
+              "value": "application/json"
+            }
           ]
         },
         "sendBody": true,
         "specifyBody": "json",
         "jsonBody": "={{ JSON.stringify({\n  model: 'claude-opus-5',\n  max_tokens: 4096,\n  output_config: {\n    effort: 'low',\n    format: {\n      type: 'json_schema',\n      schema: {\n        type: 'object',\n        properties: {\n          faqs: {\n            type: 'array',\n            items: {\n              type: 'object',\n              properties: {\n                question: { type: 'string' },\n                frequency: { type: 'integer' }\n              },\n              required: ['question', 'frequency'],\n              additionalProperties: false\n            }\n          }\n        },\n        required: ['faqs'],\n        additionalProperties: false\n      }\n    }\n  },\n  messages: [{\n    role: 'user',\n    content: 'Below are visitor questions from an IT services company website chat, one per block, separated by ---. Cluster them into at most 15 distinct recurring questions. For each cluster write the question in the clearest neutral phrasing a visitor would recognise, and set frequency to how many raw questions fall into that cluster. Drop one-off questions that appear only once. Do not invent questions that are not represented in the input.\\n\\n' + $json.corpus\n  }]\n}) }}",
-        "options": { "timeout": 120000 }
+        "options": {
+          "timeout": 120000
+        }
       },
       "id": "c1000000-0000-4000-8000-000000000004",
       "name": "Cluster via Claude",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [560, 300],
-      "notes": "One call for the whole batch, not one per transcript — that is what keeps this a rounding error on cost. output_config.format guarantees parseable JSON, so no retry-on-parse loop is needed."
+      "notes": "retryOnFail matters more here than anywhere else in this workflow: 429s and 529s from the Anthropic API are routine, and without retry a single blip costs the whole night's clustering.",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
     },
     {
       "parameters": {
@@ -76,27 +107,71 @@
     },
     {
       "parameters": {
-        "operation": "executeQuery",
-        "query": "INSERT INTO faq_summary (question, frequency, last_seen_at)\nVALUES ($1, $2, now())\nON CONFLICT (question)\nDO UPDATE SET frequency    = faq_summary.frequency + EXCLUDED.frequency,\n              last_seen_at = now()",
+        "method": "POST",
+        "url": "={{ $credentials.host }}/rest/v1/rpc/bump_faq",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "supabaseApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ p_question: $json.question, p_frequency: $json.frequency }) }}",
         "options": {
-          "queryReplacement": "={{ $json.question }},={{ $json.frequency }}"
+          "timeout": 15000
         }
       },
-      "id": "c1000000-0000-4000-8000-000000000006",
       "name": "Upsert faq_summary",
-      "type": "n8n-nodes-base.postgres",
-      "typeVersion": 2.5,
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "credentials": {
+        "supabaseApi": {
+          "id": "REPLACE_SUPABASE_CRED_ID",
+          "name": "AI Sales Agent Supabase"
+        }
+      },
+      "notes": "bump_faq does frequency = frequency + EXCLUDED.frequency in one statement. Get -> IF -> Update would lose increments under concurrency.",
+      "id": "c1000000-0000-4000-8000-000000000006",
       "position": [1000, 300],
-      "credentials": { "postgres": { "id": "REPLACE_PG_CRED_ID", "name": "Supabase Postgres" } },
-      "notes": "REQUIRES a unique index the v1 DDL does not have:\n  CREATE UNIQUE INDEX faq_summary_question_key ON faq_summary (question);\nWithout it, ON CONFLICT throws and every night inserts duplicate rows."
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
     }
   ],
   "connections": {
-    "Nightly 02:17": { "main": [[{ "node": "Fetch Recent Transcripts", "type": "main", "index": 0 }]] },
-    "Fetch Recent Transcripts": { "main": [[{ "node": "Extract Visitor Questions", "type": "main", "index": 0 }]] },
-    "Extract Visitor Questions": { "main": [[{ "node": "Cluster via Claude", "type": "main", "index": 0 }]] },
-    "Cluster via Claude": { "main": [[{ "node": "Parse Clusters", "type": "main", "index": 0 }]] },
-    "Parse Clusters": { "main": [[{ "node": "Upsert faq_summary", "type": "main", "index": 0 }]] }
+    "Nightly 02:17": {
+      "main": [
+        [
+          { "node": "Fetch Recent Transcripts", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Fetch Recent Transcripts": {
+      "main": [
+        [
+          { "node": "Extract Visitor Questions", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Extract Visitor Questions": {
+      "main": [
+        [
+          { "node": "Cluster via Claude", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Cluster via Claude": {
+      "main": [
+        [
+          { "node": "Parse Clusters", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Parse Clusters": {
+      "main": [
+        [
+          { "node": "Upsert faq_summary", "type": "main", "index": 0 }
+        ]
+      ]
+    }
   },
   "settings": {
     "executionOrder": "v1",

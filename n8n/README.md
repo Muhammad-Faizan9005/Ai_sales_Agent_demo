@@ -103,6 +103,48 @@ Then set two n8n environment variables to those credentials (§4 below).
 
 ---
 
+## 2.1 Which database — a separate Supabase project
+
+`agent_runs` and `faq_summary` go in **their own new Supabase project**, not
+AutoCRM's. Free tier covers it, so this costs nothing.
+
+The deciding reason is credential blast radius. n8n holds a **direct Postgres
+credential**, and in AutoCRM's project that credential can read `agents`
+(your users), `customers`, `deals`, `leads` and `revoked_tokens`. In its own
+project it can reach exactly two tables. n8n is third-party-hosted and runs
+community nodes; it should not hold raw SQL access to the CRM.
+
+The architecture already assumes this split — every AutoCRM touch in these
+workflows goes over HTTP with a scoped service account, never SQL. The database
+boundary should match the one the workflows already respect.
+
+Two supporting reasons:
+
+- AutoCRM already has a table called **`ai_agent_runs`** (the AI\_service
+  microservice's run log). Putting `agent_runs` beside it in the same database
+  is a 3am confusion generator — two similar names, two unrelated systems.
+- Different clients and lifecycles: this agent is for systematicitsolutions.com
+  and is a capability demo; AutoCRM is your product.
+
+One thing that is *not* a reason: AutoCRM's Alembic setup has
+`target_metadata = None`, so autogenerate is a no-op and would never try to drop
+unknown tables. Hand-written migrations only.
+
+**Connection mode: use the Session pooler**,
+`aws-[region].pooler.supabase.com:5432`. The direct connection
+(`db.[ref].supabase.co:5432`) is **IPv6-only** unless you buy the IPv4 add-on, and
+n8n Cloud will not reach it. Session mode is IPv4 on every tier and supports
+prepared statements. Do **not** use transaction mode (port 6543) — it drops
+prepared statement support, which is a needless risk for a persistent client.
+
+Run [`../schema.sql`](../schema.sql) against this project. It ends with deny-all
+RLS on both tables: Supabase publishes `public` through PostgREST, so without it
+the anon key would read every chat transcript, name, email and phone. RLS with
+zero policies blocks the API roles while leaving n8n untouched, because it
+connects as `postgres` and a table owner bypasses RLS.
+
+---
+
 ## 3. n8n credentials to create
 
 Create these in **Credentials**, then swap the placeholder IDs in the JSON (or just re-select each credential in the UI after import — faster and less error-prone).
@@ -110,7 +152,7 @@ Create these in **Credentials**, then swap the placeholder IDs in the JSON (or j
 | Placeholder in JSON | Credential type | Notes |
 |---|---|---|
 | `REPLACE_HEADER_AUTH_CRED_ID` | Header Auth | Name: `X-Webhook-Secret`. Value: a long random string — this is your app's `N8N_WEBHOOK_SECRET` |
-| `REPLACE_PG_CRED_ID` | Postgres | Supabase connection. Use the **direct** connection (port 5432), not the pooler — n8n holds connections across nodes |
+| `REPLACE_PG_CRED_ID` | Postgres | **Its own Supabase project, not AutoCRM's** (see §2.1). Use the **Session pooler**: `aws-[region].pooler.supabase.com:5432` |
 | `REPLACE_SHEETS_CRED_ID` | Google Sheets OAuth2 | Scope `spreadsheets`. Share the sheet with the OAuth account |
 | `REPLACE_WHATSAPP_CRED_ID` | WhatsApp | Meta Cloud API access token + app secret |
 | `REPLACE_SMTP_CRED_ID` | SMTP | Or swap the `emailSend` nodes for Gmail / SendGrid / Mailjet |
@@ -212,7 +254,71 @@ it's a one-node swap — but pick deliberately rather than by default.
 
 ---
 
-## 8. Before the first real run
+## 8. Error handling
+
+Every node that touches the network retries **3× with 5s backoff** (n8n's
+ceiling on both). Transient 429s and upstream blips are absorbed before anything
+reaches an error path, so a recorded failure means a real failure.
+
+Beyond retry, each node is classified by one question: **if this fails, is the
+downstream work still meaningful?**
+
+| | Nodes | `onError` | On failure |
+|---|---|---|---|
+| **Critical** | Login, Extract Cookies, Check Existing Sync, Upsert Lead, all 3 Write Backs, both Lookups, Update Lead Status | `continueErrorOutput` | Branch stops, `Record Failure` writes `agent_runs.error` |
+| **Non-fatal** | Sheets, WhatsApp, all 3 Notify Rep, both task creations | `continueRegularOutput` | Skipped, chain continues to the write-back |
+
+The split matters most at `Upsert AutoCRM Lead`. Making it non-fatal would look
+more "graceful" and would be much worse: every downstream node reads
+`$('Upsert AutoCRM Lead').item.json.id`, so the chain would write a blank
+`crm_lead_id` and then set `crm_synced = true` — the dashboard reporting a
+successful sync that never happened.
+
+**`Record Failure`** is the single shared error sink. It stores the failing node
+name (`$prevNode.name`) plus the n8n execution id, not the raw error text — the
+Query Parameters field is comma-separated, so a message containing a comma would
+shift every parameter after it. The stack trace stays in n8n's execution log,
+and the DB gets a pointer to it. It uses `INSERT … ON CONFLICT` rather than
+`UPDATE` so the failure is still recorded when no `agent_runs` row exists;
+an `UPDATE` would match zero rows and lose it silently.
+
+### The write-backs no longer lie
+
+They previously set `sheets_synced = true` and `notification_sent = true`
+unconditionally, while the Sheets and email nodes were already
+`continueRegularOutput`. A failed email therefore wrote "notified" to the
+dashboard. Those flags are now driven by whether the node actually errored:
+
+```
+notification_sent = {{ !$('Notify Rep (Email)').item.json.error }}
+```
+
+The meeting and proposal branches additionally record `'prep task not created'` /
+`'follow-up task not created'` into `error`, since a lost rep reminder would
+otherwise be invisible outside n8n's execution log.
+
+### Zero-row lookups
+
+Both `Lookup Lead` nodes have `alwaysOutputData: true`, so a `meeting_booked`
+event arriving with no matching `agent_runs` row still emits an item. The
+undefined `crm_lead_id` then fails `Update Lead Status` against AutoCRM, which
+routes to `Record Failure`. Out-of-order events get recorded, not silently
+dropped — but the message names `Update Lead Status`, not the real cause.
+
+### The error handler protects itself
+
+`sales-agent-error-handler.json` had `Record Error on Run → Alert Ops`
+hard-chained. A transient DB blip meant the write failed *and* the human alert
+never fired — total silence about the original failure. `Record Error on Run` is
+now `continueRegularOutput`, so the alert always sends.
+
+That workflow deliberately has **no** `errorWorkflow` of its own (it would
+recurse). `Alert Ops` keeps the default stop-on-error so that a genuinely
+undeliverable alert shows the execution red in n8n — the signal of last resort.
+
+---
+
+## 9. Before the first real run
 
 - [ ] **Run `../schema.sql`.** `agent_runs` and `faq_summary` do not exist
       anywhere — not in AutoCRM (whose `ai_agent_runs` is the separate AI_service
@@ -231,7 +337,8 @@ it's a one-node swap — but pick deliberately rather than by default.
 - [ ] Import error handler → copy its ID → paste into the other two workflows' settings
 - [ ] Fire a test `lead_created` with curl and confirm: lead appears in AutoCRM, note attached, Sheets row added, email received, `agent_runs.crm_lead_id` populated
 - [ ] Fire the **same** payload again — it must stop at `Already Synced` and create nothing. Then confirm the layer beneath it: temporarily bypass that guard and re-fire, and `/ingest` should update the existing lead rather than duplicate it, with no second note. The widget rehydrating on every WordPress page load makes duplicate emits routine, not hypothetical
-- [ ] Break something on purpose (wrong AutoCRM password) and confirm `agent_runs.error` gets written
+- [ ] Break something on purpose (wrong AutoCRM password) and confirm `agent_runs.error` gets written. Expect it to take ~15s first — the login node retries 3× at 5s before giving up, which is correct behaviour, not a hang
+- [ ] Break the **notification** instead (bad SMTP credential) and confirm the opposite: the lead still reaches AutoCRM, and `agent_runs.notification_sent` is `false` rather than `true`. That's the §8 write-back fix doing its job
 
 ---
 
