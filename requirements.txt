@@ -1,0 +1,52 @@
+# AI Sales Agent -- runtime dependencies
+#
+#   pip install -r requirements.txt
+#
+# Versions match what the project is developed and tested against.
+
+fastapi==0.138.1
+uvicorn==0.49.0
+pydantic==2.13.4
+pydantic-settings==2.14.2
+httpx==0.28.1
+
+# agent_runs persistence (api/store.py imports psycopg2 lazily, so a missing
+# driver degrades to "chat works, nothing is saved" rather than a crash).
+psycopg2-binary==2.9.10
+
+# Windows ships no IANA time zone database, so zoneinfo.ZoneInfo("Asia/Karachi")
+# raises ZoneInfoNotFoundError at runtime without this -- which is exactly how
+# booking broke in development. Linux/macOS have it in the OS, but pin it
+# everywhere so dev and prod resolve identical offsets.
+tzdata==2025.2
+
+# --------------------------------------------------------------------------
+# Retrieval -- FAISS index + local embeddings
+#
+# The knowledge base moved out of the system prompt and into a vector index.
+# Ollama serves minimax-m3 with no prompt cache, so the previous design paid
+# for all ~38k KB tokens on every single turn.
+# --------------------------------------------------------------------------
+
+# all-MiniLM-L6-v2, 384 dimensions. Weights are local, so retrieval keeps
+# working when the Ollama daemon is down -- chat and retrieval fail
+# independently now.
+#
+# Pulls torch in transitively; deliberately not pinned here (AI_service does
+# the same). Windows and macOS get the CPU wheel by default, but on LINUX the
+# default is CUDA and ~3GB, so the Dockerfile must install torch from
+# https://download.pytorch.org/whl/cpu BEFORE this file.
+#
+# The model truncates at 256 word pieces and does it SILENTLY -- no error, just
+# an embedding of the first part of an over-long chunk. kb/chunk.py asserts
+# chunks stay under that ceiling; re-read it before raising the chunk size.
+sentence-transformers==5.7.0
+
+# IndexFlatIP over ~600 normalised vectors: exact brute-force cosine search --
+# no training step, no nlist/nprobe tuning, no recall cliff. IVF or HNSW only
+# begins to pay off orders of magnitude further up.
+faiss-cpu==1.15.0
+
+# Direct, not merely transitive: kb/embed.py and api/retrieval.py both handle
+# the vectors as arrays either side of FAISS.
+numpy==2.3.4

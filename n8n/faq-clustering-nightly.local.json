@@ -1,5 +1,5 @@
 {
-  "name": "faq-clustering-nightly",
+  "name": "faq-clustering-nightly (local)",
   "nodes": [
     {
       "parameters": {
@@ -16,7 +16,10 @@
       "name": "Nightly 02:17",
       "type": "n8n-nodes-base.scheduleTrigger",
       "typeVersion": 1.2,
-      "position": [-100, 300],
+      "position": [
+        -100,
+        300
+      ],
       "notes": "02:17 rather than 02:00 on purpose — everyone's cron lands on the hour, including Anthropic's other callers."
     },
     {
@@ -34,12 +37,15 @@
       "typeVersion": 1,
       "credentials": {
         "supabaseApi": {
-          "id": "REPLACE_SUPABASE_CRED_ID",
-          "name": "AI Sales Agent Supabase"
+          "id": "szox4UWsZWBiuv2V",
+          "name": "Supabase account"
         }
       },
       "id": "c1000000-0000-4000-8000-000000000002",
-      "position": [120, 300],
+      "position": [
+        120,
+        300
+      ],
       "retryOnFail": true,
       "maxTries": 3,
       "waitBetweenTries": 5000,
@@ -53,7 +59,10 @@
       "name": "Extract Visitor Questions",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [340, 300]
+      "position": [
+        340,
+        300
+      ]
     },
     {
       "parameters": {
@@ -87,7 +96,10 @@
       "name": "Cluster via Claude",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [560, 300],
+      "position": [
+        560,
+        300
+      ],
       "notes": "retryOnFail matters more here than anywhere else in this workflow: 429s and 529s from the Anthropic API are routine, and without retry a single blip costs the whole night's clustering.",
       "retryOnFail": true,
       "maxTries": 3,
@@ -101,7 +113,10 @@
       "name": "Parse Clusters",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [780, 300]
+      "position": [
+        780,
+        300
+      ]
     },
     {
       "parameters": {
@@ -121,13 +136,16 @@
       "typeVersion": 4.2,
       "credentials": {
         "supabaseApi": {
-          "id": "REPLACE_SUPABASE_CRED_ID",
-          "name": "AI Sales Agent Supabase"
+          "id": "szox4UWsZWBiuv2V",
+          "name": "Supabase account"
         }
       },
       "notes": "bump_faq does frequency = frequency + EXCLUDED.frequency in one statement. Get -> IF -> Update would lose increments under concurrency.",
       "id": "c1000000-0000-4000-8000-000000000006",
-      "position": [1000, 300],
+      "position": [
+        1000,
+        300
+      ],
       "onError": "continueRegularOutput",
       "retryOnFail": true,
       "maxTries": 3,
@@ -138,42 +156,62 @@
     "Nightly 02:17": {
       "main": [
         [
-          { "node": "Fetch Recent Transcripts", "type": "main", "index": 0 }
+          {
+            "node": "Fetch Recent Transcripts",
+            "type": "main",
+            "index": 0
+          }
         ]
       ]
     },
     "Fetch Recent Transcripts": {
       "main": [
         [
-          { "node": "Extract Visitor Questions", "type": "main", "index": 0 }
+          {
+            "node": "Extract Visitor Questions",
+            "type": "main",
+            "index": 0
+          }
         ]
       ]
     },
     "Extract Visitor Questions": {
       "main": [
         [
-          { "node": "Cluster via Claude", "type": "main", "index": 0 }
+          {
+            "node": "Cluster via Claude",
+            "type": "main",
+            "index": 0
+          }
         ]
       ]
     },
     "Cluster via Claude": {
       "main": [
         [
-          { "node": "Parse Clusters", "type": "main", "index": 0 }
+          {
+            "node": "Parse Clusters",
+            "type": "main",
+            "index": 0
+          }
         ]
       ]
     },
     "Parse Clusters": {
       "main": [
         [
-          { "node": "Upsert faq_summary", "type": "main", "index": 0 }
+          {
+            "node": "Upsert faq_summary",
+            "type": "main",
+            "index": 0
+          }
         ]
       ]
     }
   },
   "settings": {
     "executionOrder": "v1",
-    "errorWorkflow": "REPLACE_ERROR_WORKFLOW_ID"
+    "errorWorkflow": "15HLl7LZ0x9ORtMb"
   },
   "pinData": {},
   "tags": []

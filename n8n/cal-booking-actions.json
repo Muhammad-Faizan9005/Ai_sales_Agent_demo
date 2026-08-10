@@ -1,0 +1,540 @@
+{
+  "name": "cal-booking-actions",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "cal-action",
+        "authentication": "headerAuth",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "d1000000-0000-4000-8000-000000000001",
+      "name": "Actions Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -200,
+        320
+      ],
+      "webhookId": "cal-booking-actions",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_HEADER_AUTH_CRED_ID",
+          "name": "Sales Agent Webhook Secret"
+        }
+      },
+      "notes": "responseMode lastNode, NOT onReceived: the caller needs the booking uid back to show a confirmation. Reuses the same X-Webhook-Secret credential as sales-agent-events.\n\nPOST { action: book|cancel|reschedule, session_id, start?, booking_uid?, attendee:{name,email,timeZone}, reason? }"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Validate up front so a bad request fails here with a clear message, rather\n// than as a confusing 400 from Cal.com three nodes later.\nconst b = $('Actions Webhook').item.json.body ?? {};\nconst action = String(b.action ?? '').toLowerCase();\n\nif (!['book', 'cancel', 'reschedule'].includes(action)) {\n  throw new Error(`action must be book|cancel|reschedule, got: ${b.action}`);\n}\nif (!b.session_id) throw new Error('session_id is required to tie the booking to a run');\n\nif (action === 'book') {\n  if (!b.start)          throw new Error('book requires start (ISO 8601, UTC)');\n  if (!b.attendee?.email) throw new Error('book requires attendee.email');\n} else {\n  if (!b.booking_uid) throw new Error(`${action} requires booking_uid`);\n  if (action === 'reschedule' && !b.start) throw new Error('reschedule requires the new start');\n}\n\n// Cal.com rejects a start that carries an offset -- it must be UTC with a Z.\nlet startUtc = null;\nif (b.start) {\n  const dt = DateTime.fromISO(b.start, { setZone: true });\n  if (!dt.isValid) throw new Error(`Unparseable start: ${b.start}`);\n  startUtc = dt.toUTC().toISO({ suppressMilliseconds: true });\n}\n\nreturn [{\n  json: {\n    action,\n    sessionId:   b.session_id,\n    bookingUid:  b.booking_uid ?? null,\n    start:       startUtc,\n    reason:      b.reason ?? '',\n    attendee: {\n      name:     b.attendee?.name  ?? 'Guest',\n      email:    b.attendee?.email ?? '',\n      timeZone: b.attendee?.timeZone || $env.MEETING_TIMEZONE || 'Asia/Karachi',\n      language: b.attendee?.language ?? 'en',\n    },\n    eventTypeId:   b.event_type_id ?? null,\n    eventTypeSlug: b.event_type_slug ?? $env.CAL_EVENT_TYPE_SLUG ?? null,\n    username:      b.username ?? $env.CAL_USERNAME ?? null,\n  },\n}];"
+      },
+      "id": "d1000000-0000-4000-8000-000000000002",
+      "name": "Validate Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        20,
+        320
+      ],
+      "onError": "continueErrorOutput",
+      "notes": "Fails fast with a readable message, and converts start to UTC -- Cal.com rejects an offset-bearing start."
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "sw-book",
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "book",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "book"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "sw-cancel",
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "cancel",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "cancel"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "sw-resched",
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "reschedule",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "reschedule"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "d1000000-0000-4000-8000-000000000003",
+      "name": "Route Action",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        240,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.cal.com/v2/bookings",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.CAL_API_KEY }}"
+            },
+            {
+              "name": "cal-api-version",
+              "value": "2024-08-13"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 20000
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify(Object.assign({\n  start: $('Validate Request').item.json.start,\n  attendee: $('Validate Request').item.json.attendee,\n  // metadata is how an inbound BOOKING_CREATED webhook finds the run.\n  // Note Cal.com omits metadata from BOOKING_CANCELLED (calcom#27783),\n  // which is why agent_runs also stores cal_booking_uid.\n  metadata: { session_id: $('Validate Request').item.json.sessionId },\n}, $('Validate Request').item.json.eventTypeId\n     ? { eventTypeId: $('Validate Request').item.json.eventTypeId }\n     : { eventTypeSlug: $('Validate Request').item.json.eventTypeSlug, username: $('Validate Request').item.json.username })) }}"
+      },
+      "id": "d1000000-0000-4000-8000-000000000010",
+      "name": "Cal Create Booking",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        500,
+        140
+      ],
+      "onError": "continueErrorOutput",
+      "notes": "POST /v2/bookings is PUBLIC (verified 2026-08-09: an unauthenticated call reached event-type validation, not 401). The Bearer key is still sent so hidden event types resolve. Books by eventTypeId when given, else falls back to eventTypeSlug + username from CAL_EVENT_TYPE_SLUG / CAL_USERNAME.",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.cal.com/v2/bookings/{{ $('Validate Request').item.json.bookingUid }}/cancel",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.CAL_API_KEY }}"
+            },
+            {
+              "name": "cal-api-version",
+              "value": "2024-08-13"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 20000
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ cancellationReason: $('Validate Request').item.json.reason || 'Cancelled via AI sales agent' }) }}"
+      },
+      "id": "d1000000-0000-4000-8000-000000000011",
+      "name": "Cal Cancel Booking",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        500,
+        320
+      ],
+      "onError": "continueErrorOutput",
+      "notes": "Cancelling an already-cancelled booking returns 400 -- the error branch records it rather than retrying forever.",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.cal.com/v2/bookings/{{ $('Validate Request').item.json.bookingUid }}/reschedule",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.CAL_API_KEY }}"
+            },
+            {
+              "name": "cal-api-version",
+              "value": "2024-08-13"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 20000
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  start: $('Validate Request').item.json.start,\n  reschedulingReason: $('Validate Request').item.json.reason || 'Rescheduled via AI sales agent',\n}) }}"
+      },
+      "id": "d1000000-0000-4000-8000-000000000012",
+      "name": "Cal Reschedule Booking",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        500,
+        500
+      ],
+      "onError": "continueErrorOutput",
+      "notes": "Returns a NEW booking with a NEW uid; the old one becomes cancelled. Sync Booking State stores the new uid, without which the next cancel would 400.",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "jsCode": "// Cal wraps every response as { status, data }. Normalise the three actions\n// into one shape so a single write-back node handles all of them.\nconst res  = $input.first().json;\nconst data = res.data ?? res;\nconst v    = $('Validate Request').item.json;\n\nif (res.status && res.status !== 'success') {\n  throw new Error(`Cal.com returned ${res.status}: ${JSON.stringify(res.error ?? {}).slice(0, 300)}`);\n}\n\n// A reschedule returns the NEW booking with a NEW uid. Store that, or the next\n// cancel will 400 against a uid Cal.com has already marked cancelled.\nconst uid = data.uid ?? v.bookingUid;\n\nreturn [{\n  json: {\n    action:     v.action,\n    sessionId:  v.sessionId,\n    uid,\n    status:     v.action === 'cancel' ? 'cancelled' : (data.status ?? 'accepted'),\n    start:      data.start ?? v.start,\n    meetingUrl: data.meetingUrl ?? data.location ?? '',\n    booked:     v.action !== 'cancel',\n  },\n}];"
+      },
+      "id": "d1000000-0000-4000-8000-000000000020",
+      "name": "Sync Booking State",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        760,
+        320
+      ],
+      "onError": "continueErrorOutput",
+      "notes": "Unwraps Cal's { status, data } envelope and normalises all three actions into one shape."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/rpc/mark_run_outcome",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "supabaseApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  p_session_id: $json.sessionId,\n  p_cal_booking_uid: $json.uid,\n  p_cal_booking_status: $json.status,\n  p_cal_meeting_url: $json.meetingUrl,\n  p_meeting_start_at: $json.start,\n  p_meeting_booked: $json.booked,\n}) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "d1000000-0000-4000-8000-000000000021",
+      "name": "Write Booking State",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        980,
+        320
+      ],
+      "credentials": {
+        "supabaseApi": {
+          "id": "REPLACE_SUPABASE_CRED_ID",
+          "name": "Supabase account"
+        }
+      },
+      "onError": "continueErrorOutput",
+      "notes": "Stores the (possibly new) uid on agent_runs so inbound Cal webhooks and later cancels can find the run.",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "r1",
+              "name": "ok",
+              "value": "=true",
+              "type": "boolean"
+            },
+            {
+              "id": "r2",
+              "name": "action",
+              "value": "={{ $('Sync Booking State').item.json.action }}",
+              "type": "string"
+            },
+            {
+              "id": "r3",
+              "name": "booking_uid",
+              "value": "={{ $('Sync Booking State').item.json.uid }}",
+              "type": "string"
+            },
+            {
+              "id": "r4",
+              "name": "status",
+              "value": "={{ $('Sync Booking State').item.json.status }}",
+              "type": "string"
+            },
+            {
+              "id": "r5",
+              "name": "start",
+              "value": "={{ $('Sync Booking State').item.json.start }}",
+              "type": "string"
+            },
+            {
+              "id": "r6",
+              "name": "meeting_url",
+              "value": "={{ $('Sync Booking State').item.json.meetingUrl }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "d1000000-0000-4000-8000-000000000022",
+      "name": "Respond OK",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1200,
+        320
+      ],
+      "notes": "Webhook responseMode is lastNode, so this Set node IS the HTTP response body the caller receives."
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "e1",
+              "name": "ok",
+              "value": "=false",
+              "type": "boolean"
+            },
+            {
+              "id": "e2",
+              "name": "error",
+              "value": "={{ $json.error?.message ?? $json.error ?? 'booking action failed' }}",
+              "type": "string"
+            },
+            {
+              "id": "e3",
+              "name": "execution_id",
+              "value": "={{ $execution.id }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "d1000000-0000-4000-8000-0000000000f1",
+      "name": "Respond Error",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        980,
+        700
+      ],
+      "notes": "Every error path ends here so the caller always gets a JSON body instead of a timeout. n8n cannot set a 4xx/5xx status from a Set node, so the ok flag is the contract -- callers must check it, not just the HTTP code."
+    }
+  ],
+  "connections": {
+    "Actions Webhook": {
+      "main": [
+        [
+          {
+            "node": "Validate Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Request": {
+      "main": [
+        [
+          {
+            "node": "Route Action",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Action": {
+      "main": [
+        [
+          {
+            "node": "Cal Create Booking",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Cal Cancel Booking",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Cal Reschedule Booking",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cal Create Booking": {
+      "main": [
+        [
+          {
+            "node": "Sync Booking State",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cal Cancel Booking": {
+      "main": [
+        [
+          {
+            "node": "Sync Booking State",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cal Reschedule Booking": {
+      "main": [
+        [
+          {
+            "node": "Sync Booking State",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sync Booking State": {
+      "main": [
+        [
+          {
+            "node": "Write Booking State",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write Booking State": {
+      "main": [
+        [
+          {
+            "node": "Respond OK",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "saveExecutionProgress": true,
+    "errorWorkflow": "REPLACE_ERROR_WORKFLOW_ID"
+  },
+  "pinData": {},
+  "tags": []
+}

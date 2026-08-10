@@ -1,5 +1,5 @@
 {
-  "name": "sales-agent-events",
+  "name": "sales-agent-events (local)",
   "nodes": [
     {
       "parameters": {
@@ -21,7 +21,7 @@
       "webhookId": "sales-agent-events",
       "credentials": {
         "httpHeaderAuth": {
-          "id": "REPLACE_HEADER_AUTH_CRED_ID",
+          "id": "Dbye85qyr3DiF3jG",
           "name": "Sales Agent Webhook Secret"
         }
       },
@@ -203,8 +203,8 @@
       "typeVersion": 1,
       "credentials": {
         "supabaseApi": {
-          "id": "REPLACE_SUPABASE_CRED_ID",
-          "name": "AI Sales Agent Supabase"
+          "id": "szox4UWsZWBiuv2V",
+          "name": "Supabase account"
         }
       },
       "id": "a1000000-0000-4000-8000-000000000010",
@@ -300,12 +300,12 @@
         "operation": "appendOrUpdate",
         "documentId": {
           "__rl": true,
-          "value": "REPLACE_SHEET_ID",
-          "mode": "id"
+          "value": "https://docs.google.com/spreadsheets/d/1r0qOPJDRONAvYXJhwTBHNtfsuF1x_eagCLyG-DObpqA/edit?usp=sharing",
+          "mode": "url"
         },
         "sheetName": {
           "__rl": true,
-          "value": "Leads",
+          "value": "Sheet1",
           "mode": "name"
         },
         "columns": {
@@ -422,8 +422,8 @@
       ],
       "credentials": {
         "googleSheetsOAuth2Api": {
-          "id": "REPLACE_SHEETS_CRED_ID",
-          "name": "Google Sheets"
+          "id": "WjcvKmC4XjMNT0jE",
+          "name": "Google Sheets account"
         }
       },
       "onError": "continueRegularOutput",
@@ -517,7 +517,7 @@
       ],
       "credentials": {
         "mailjetEmailApi": {
-          "id": "REPLACE_MAILJET_CRED_ID",
+          "id": "6ApVgdiLsjekE01f",
           "name": "Mailjet Email account"
         }
       },
@@ -544,8 +544,8 @@
       "typeVersion": 4.2,
       "credentials": {
         "supabaseApi": {
-          "id": "REPLACE_SUPABASE_CRED_ID",
-          "name": "AI Sales Agent Supabase"
+          "id": "szox4UWsZWBiuv2V",
+          "name": "Supabase account"
         }
       },
       "notes": "Was a Postgres UPDATE. mark_run_outcome COALESCEs every optional arg, so omitted keys leave their column untouched.",
@@ -573,8 +573,8 @@
       "typeVersion": 1,
       "credentials": {
         "supabaseApi": {
-          "id": "REPLACE_SUPABASE_CRED_ID",
-          "name": "AI Sales Agent Supabase"
+          "id": "szox4UWsZWBiuv2V",
+          "name": "Supabase account"
         }
       },
       "id": "a1000000-0000-4000-8000-000000000020",
@@ -687,7 +687,7 @@
       ],
       "credentials": {
         "mailjetEmailApi": {
-          "id": "REPLACE_MAILJET_CRED_ID",
+          "id": "6ApVgdiLsjekE01f",
           "name": "Mailjet Email account"
         }
       },
@@ -714,8 +714,8 @@
       "typeVersion": 4.2,
       "credentials": {
         "supabaseApi": {
-          "id": "REPLACE_SUPABASE_CRED_ID",
-          "name": "AI Sales Agent Supabase"
+          "id": "szox4UWsZWBiuv2V",
+          "name": "Supabase account"
         }
       },
       "notes": "p_error is added only on failure. Sending null would be COALESCEd to a no-op anyway, but omitting the key keeps the request honest.",
@@ -743,8 +743,8 @@
       "typeVersion": 1,
       "credentials": {
         "supabaseApi": {
-          "id": "REPLACE_SUPABASE_CRED_ID",
-          "name": "AI Sales Agent Supabase"
+          "id": "szox4UWsZWBiuv2V",
+          "name": "Supabase account"
         }
       },
       "id": "a1000000-0000-4000-8000-000000000030",
@@ -819,7 +819,7 @@
       ],
       "credentials": {
         "mailjetEmailApi": {
-          "id": "REPLACE_MAILJET_CRED_ID",
+          "id": "6ApVgdiLsjekE01f",
           "name": "Mailjet Email account"
         }
       },
@@ -846,8 +846,8 @@
       "typeVersion": 4.2,
       "credentials": {
         "supabaseApi": {
-          "id": "REPLACE_SUPABASE_CRED_ID",
-          "name": "AI Sales Agent Supabase"
+          "id": "szox4UWsZWBiuv2V",
+          "name": "Supabase account"
         }
       },
       "notes": "See Write Back (meeting).",
@@ -903,8 +903,8 @@
       "typeVersion": 4.2,
       "credentials": {
         "supabaseApi": {
-          "id": "REPLACE_SUPABASE_CRED_ID",
-          "name": "AI Sales Agent Supabase"
+          "id": "szox4UWsZWBiuv2V",
+          "name": "Supabase account"
         }
       },
       "notes": "INSERT .. ON CONFLICT inside record_run_error, so the failure is captured even when no agent_runs row exists yet.",
@@ -957,7 +957,7 @@
       ],
       "credentials": {
         "mailjetEmailApi": {
-          "id": "REPLACE_MAILJET_CRED_ID",
+          "id": "6ApVgdiLsjekE01f",
           "name": "Mailjet Email account"
         }
       },
@@ -1340,7 +1340,7 @@
     "executionOrder": "v1",
     "saveManualExecutions": true,
     "saveExecutionProgress": true,
-    "errorWorkflow": "REPLACE_ERROR_WORKFLOW_ID"
+    "errorWorkflow": "15HLl7LZ0x9ORtMb"
   },
   "pinData": {},
   "tags": []

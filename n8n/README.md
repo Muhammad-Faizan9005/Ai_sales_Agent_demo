@@ -1,5 +1,11 @@
 # n8n Setup — AI Sales Agent
 
+> **Node-level reference:** [`docs_n8n/`](docs_n8n/) documents all 58 nodes across
+> the five live `*.local.json` workflows — every parameter, expression, payload and
+> schema. Start at [`docs_n8n/contracts.md`](docs_n8n/contracts.md) when wiring the
+> agent's tools. This file stays the *setup* guide: credentials, env vars, and the
+> decisions behind the design.
+
 Three workflows. Import in this order; the first two reference the third by ID.
 
 | File | Trigger | Purpose |
@@ -108,11 +114,13 @@ Then set two n8n environment variables to those credentials (§4 below).
 `agent_runs` and `faq_summary` go in **their own new Supabase project**, not
 AutoCRM's. Free tier covers it, so this costs nothing.
 
-The deciding reason is credential blast radius. n8n holds a **direct Postgres
-credential**, and in AutoCRM's project that credential can read `agents`
-(your users), `customers`, `deals`, `leads` and `revoked_tokens`. In its own
-project it can reach exactly two tables. n8n is third-party-hosted and runs
-community nodes; it should not hold raw SQL access to the CRM.
+The deciding reason is credential blast radius. n8n holds a **Supabase
+`service_role` key**, which bypasses RLS on every table in whatever project it
+belongs to and also reaches the Auth and Storage admin endpoints. Pointed at
+AutoCRM's project that is total access — `agents` (your users), `customers`,
+`deals`, `leads`, `revoked_tokens`. In its own project it reaches exactly two
+tables. n8n is third-party-hosted and runs community nodes; it should not hold a
+key like that for the CRM.
 
 The architecture already assumes this split — every AutoCRM touch in these
 workflows goes over HTTP with a scoped service account, never SQL. The database
@@ -130,18 +138,25 @@ One thing that is *not* a reason: AutoCRM's Alembic setup has
 `target_metadata = None`, so autogenerate is a no-op and would never try to drop
 unknown tables. Hand-written migrations only.
 
-**Connection mode: use the Session pooler**,
-`aws-[region].pooler.supabase.com:5432`. The direct connection
-(`db.[ref].supabase.co:5432`) is **IPv6-only** unless you buy the IPv4 add-on, and
-n8n Cloud will not reach it. Session mode is IPv4 on every tier and supports
-prepared statements. Do **not** use transaction mode (port 6543) — it drops
-prepared statement support, which is a needless risk for a persistent client.
+**No connection string needed.** The workflows talk to this project over HTTPS
+through PostgREST, using only the project URL and the `service_role` key — so
+the whole IPv4/IPv6, pooler-vs-direct question does not arise. (For reference,
+if you ever do connect a SQL client: the direct connection
+`db.[ref].supabase.co:5432` is IPv6-only without the paid IPv4 add-on, so use the
+Session pooler `aws-[region].pooler.supabase.com:5432` instead.)
 
-Run [`../schema.sql`](../schema.sql) against this project. It ends with deny-all
-RLS on both tables: Supabase publishes `public` through PostgREST, so without it
-the anon key would read every chat transcript, name, email and phone. RLS with
-zero policies blocks the API roles while leaving n8n untouched, because it
-connects as `postgres` and a table owner bypasses RLS.
+Run [`../schema.sql`](../schema.sql) against this project — paste the whole file
+into the SQL editor. It creates both tables, then:
+
+- **Deny-all RLS.** Supabase publishes `public` through PostgREST, so without it
+  the anon key — which ships in browser bundles — would read every chat
+  transcript, name, email and phone. Zero policies blocks `anon` and
+  `authenticated`; n8n is unaffected because `service_role` carries `BYPASSRLS`.
+- **Three functions** — `mark_run_outcome`, `record_run_error`, `bump_faq` —
+  which is how the writes happen (§3.1).
+- **`REVOKE … FROM PUBLIC`** on all three. Postgres grants `EXECUTE` to `PUBLIC`
+  by default, which would have let the anon key overwrite any run's error text
+  and inflate FAQ counts, quietly undoing the RLS above.
 
 ---
 
@@ -152,12 +167,57 @@ Create these in **Credentials**, then swap the placeholder IDs in the JSON (or j
 | Placeholder in JSON | Credential type | Notes |
 |---|---|---|
 | `REPLACE_HEADER_AUTH_CRED_ID` | Header Auth | Name: `X-Webhook-Secret`. Value: a long random string — this is your app's `N8N_WEBHOOK_SECRET` |
-| `REPLACE_PG_CRED_ID` | Postgres | **Its own Supabase project, not AutoCRM's** (see §2.1). Use the **Session pooler**: `aws-[region].pooler.supabase.com:5432` |
+| `REPLACE_SUPABASE_CRED_ID` | Supabase API | **Its own project, not AutoCRM's** (see §2.1). Host = the project URL (`https://[ref].supabase.co`), Service Role Secret = Settings → API Keys → `service_role`. Used by both the Supabase nodes and the RPC HTTP nodes |
 | `REPLACE_SHEETS_CRED_ID` | Google Sheets OAuth2 | Scope `spreadsheets`. Share the sheet with the OAuth account |
 | `REPLACE_WHATSAPP_CRED_ID` | WhatsApp | Meta Cloud API access token + app secret |
 | `REPLACE_SMTP_CRED_ID` | SMTP | Or swap the `emailSend` nodes for Gmail / SendGrid / Mailjet |
 
 AutoCRM deliberately has **no** n8n credential — it authenticates by logging in per execution with env-var credentials, since n8n has no built-in cookie-jar credential type.
+
+---
+
+## 3.1 How the Supabase access is split — reads native, writes by RPC
+
+Everything reaches Supabase over HTTPS on the one `supabaseApi` credential. But
+it lands in two different node types, and the split is not stylistic:
+
+| Nodes | Type | Why |
+|---|---|---|
+| `Check Existing Sync`, `Lookup Lead (meeting)`, `Lookup Lead (proposal)`, `Fetch Recent Transcripts` | **Supabase** node, Get Many | Plain filtered reads. The node does these cleanly |
+| `Write Back (lead_created)`, `Write Back (meeting)`, `Write Back (proposal)`, `Record Failure`, `Record Error on Run`, `Upsert faq_summary` | **HTTP Request** → `POST /rest/v1/rpc/<fn>` | See below |
+
+The Supabase node has exactly five operations — Create, Delete, Get, Get Many,
+Update — and **no upsert**. Three of those writes are `INSERT … ON CONFLICT`, and
+two problems make emulating them wrong rather than merely verbose:
+
+- **Lost updates.** `bump_faq` does
+  `frequency = faq_summary.frequency + EXCLUDED.frequency` in one statement. As
+  Get → IF → Update, two concurrent runs both read the old count and one
+  increment vanishes.
+- **Lost failures.** `record_run_error` must capture an error even when no
+  `agent_runs` row exists yet. A plain Update matches zero rows and drops the
+  failure silently — the exact opposite of what an error sink is for.
+
+There is a third, subtler reason the write-backs are RPC too. The Supabase node
+types field values as **strings**, so an expression returning `null` arrives as
+`""`. `Write Back (meeting)` and `(proposal)` set `error` to null on success —
+writing `""` there would make every successful run look failed to any dashboard
+checking `error IS NOT NULL`. `mark_run_outcome` sidesteps it by `COALESCE`-ing
+every optional argument, so a caller simply omits the keys it does not set.
+
+Two details worth knowing if you edit these nodes:
+
+- The RPC URL uses **`{{ $env.SUPABASE_URL }}`**, not the credential. n8n does not
+  expose credentials to the expression layer, so `{{ $credentials.host }}` does
+  not resolve. The credential still supplies the `apikey` and `Authorization`
+  headers via `predefinedCredentialType`.
+- The Supabase node's **Get Many has no "select" option**, so the column list is
+  appended to the filter string (`…&select=crm_lead_id`). `Order By` *is* a real
+  parameter, so `Fetch Recent Transcripts` uses it rather than an inline `order=`.
+
+If you add a function to `schema.sql` later, remember the `REVOKE … FROM PUBLIC`
+and the `NOTIFY pgrst, 'reload schema'` — without the latter PostgREST 404s the
+new function until it next restarts.
 
 ---
 
@@ -169,6 +229,11 @@ Set on the n8n instance (Settings → Variables on Cloud, or the container env o
 AUTOCRM_BASE_URL=https://your-autocrm-deployment
 AUTOCRM_SERVICE_EMAIL=n8n-agent@yourdomain.com
 AUTOCRM_SERVICE_PASSWORD=...
+
+# The AI Sales Agent's own Supabase project (§2.1) — no trailing slash.
+# The six RPC nodes build their URL from this; the apikey and Authorization
+# headers come from the Supabase credential, not from here.
+SUPABASE_URL=https://[ref].supabase.co
 
 ANTHROPIC_API_KEY=sk-ant-...
 
@@ -183,6 +248,110 @@ SALES_LEAD_WHATSAPP=+92...
 Also replace `REPLACE_SHEET_ID` in the `Append to Sheets` node with your spreadsheet ID, and create a `Leads` tab with a header row matching the mapped columns: `captured_at, session_id, name, email, phone, company, service, score, crm_lead_id`.
 
 > **Self-hosted n8n:** `$env` access in expressions is blocked unless you set `N8N_BLOCK_ENV_ACCESS_IN_NODE=false`. Without it every `{{ $env.X }}` resolves empty and you'll chase phantom auth failures.
+
+### Cal.com variables
+
+The two Cal workflows add three more. They already exist in `Ai Sales Agent/.env`; copy the values across:
+
+```
+CAL_API_KEY=cal_live_...
+CAL_USERNAME=muhammad-faizan-haider-ali-nb2t6u
+CAL_EVENT_TYPE_SLUG=30min
+```
+
+Verified live on 2026-08-09: the key authenticates against `GET /v2/me`, and `30min`
+resolves to event type **6597690** (the account also has `15min` = 6597691 and
+`secret` = 6597692). Booking by slug + username avoids hard-coding the numeric id,
+but you can pass `event_type_id` per request to override it.
+
+---
+
+## 4.1 Cal.com — book, cancel and reschedule (API v2)
+
+**n8n has no Cal.com action node.** It ships only a *Cal Trigger*, and that trigger
+is currently broken: it still calls the decommissioned v1 API and fails with
+*"API v1 has been decommissioned. Please migrate to API v2"*
+([n8n community](https://community.n8n.io/t/cal-com-connector-node-doesnt-work-after-v2-api/295058)).
+There is an [open feature request](https://community.n8n.io/t/need-your-help-upvoting-a-feature-request/300025).
+So both Cal workflows use plain HTTP Request nodes against `api.cal.com/v2`.
+
+### The trap: `cal-api-version` is per-endpoint
+
+Not one global value. Send the wrong date and you get `404 Cannot GET /v2/slots`,
+which reads like a bad URL rather than a bad header. Verified by direct probe:
+
+| Endpoint | Version |
+|---|---|
+| `GET /v2/slots` | `2024-09-04` |
+| `GET /v2/event-types` | `2024-06-14` |
+| `POST /v2/bookings` and everything under `/v2/bookings/{uid}/...` | `2024-08-13` |
+
+Every response wraps in `{ status, data }`, so expressions read `$json.data.uid` —
+never `$json.uid`.
+
+### `cal-booking-actions` — outbound
+
+`POST /webhook/cal-action`, guarded by the same `X-Webhook-Secret` credential as
+the main events workflow. Unlike that one it responds with the **last node**, so
+the caller gets the booking uid back for a confirmation message.
+
+```json
+{ "action": "book",        "session_id": "test-003",
+  "start": "2026-08-20T09:00:00Z",
+  "attendee": { "name": "Shafi", "email": "shafi@example.com", "timeZone": "Asia/Karachi" } }
+
+{ "action": "cancel",      "session_id": "test-002",
+  "booking_uid": "bk_abc123", "reason": "Client unavailable" }
+
+{ "action": "reschedule",  "session_id": "test-002",
+  "booking_uid": "bk_abc123", "start": "2026-08-21T14:00:00Z" }
+```
+
+Replies `{ ok, action, booking_uid, status, start, meeting_url }`. On failure
+`ok:false` with an `error` string — n8n cannot set a 4xx from a Set node, so
+**callers must check `ok`, not the HTTP status**.
+
+Two behaviours worth knowing:
+
+- **`POST /v2/bookings` is public.** Verified: an unauthenticated call reached
+  event-type validation rather than 401. The Bearer key is still sent so hidden
+  event types resolve.
+- **Cal.com rejects a `start` carrying a UTC offset.** `Validate Request`
+  normalises it — `2026-08-20T09:00:00+05:00` is converted to `2026-08-20T04:00:00Z`
+  before the call.
+
+### `cal-booking-events` — inbound
+
+Register the webhook URL at **Cal.com → Settings → Developer → Webhooks** for
+`BOOKING_CREATED`, `BOOKING_RESCHEDULED`, `BOOKING_CANCELLED`. This catches what
+the outbound path cannot see: the visitor moving or cancelling from the Cal.com
+page or the email link.
+
+On a change it updates `agent_runs`, **PATCHes the existing prep task** (moving
+`due_at`, or setting `status: canceled`) and emails the rep. It never creates a
+second task.
+
+**Auth is an unguessable path, not a header.** Cal.com cannot send a custom auth
+header — it signs the raw body with HMAC-SHA256 in `X-Cal-Signature-256`, which
+n8n's Header Auth cannot verify. So the path carries a random segment
+(`/webhook/cal-booking/<token>`) and the whole URL should be treated as a
+credential. To harden it, set a `secret` on the Cal.com webhook and verify the
+signature in a Code node before trusting the payload.
+
+### Why `agent_runs` gained `cal_booking_uid`
+
+Two Cal.com behaviours force it:
+
+1. **`BOOKING_CANCELLED` omits booking metadata**
+   ([calcom/cal.com#27783](https://github.com/calcom/cal.com/issues/27783)), so a
+   cancel event carries the uid but *not* our `session_id`. Matching on session
+   alone would silently drop every cancellation.
+2. **Rescheduling mints a NEW uid** and cancels the old one. `apply_cal_booking_event`
+   matches on the old uid and writes the new one in a single statement — otherwise
+   the next cancel would 400 against a uid Cal.com already retired.
+
+`crm_task_id` is stored for the same reason: it's what lets a reschedule move the
+existing task instead of stacking a second "Discovery call" on the lead.
 
 ---
 
@@ -320,13 +489,19 @@ undeliverable alert shows the execution red in n8n — the signal of last resort
 
 ## 9. Before the first real run
 
-- [ ] **Run `../schema.sql`.** `agent_runs` and `faq_summary` do not exist
+- [ ] **Run `../schema.sql` in full.** `agent_runs` and `faq_summary` do not exist
       anywhere — not in AutoCRM (whose `ai_agent_runs` is the separate AI_service
-      microservice's log), not in your Supabase project. Every Postgres node in
-      all three workflows hits them, so without this the first node of every
-      execution fails. The file includes the `UNIQUE` on `faq_summary.question`
-      that `ON CONFLICT` needs and the `pages_visited` / `handoff_requested`
-      columns from plan §10 — no follow-up ALTERs required.
+      microservice's log), not in a fresh Supabase project. All ten Supabase-facing
+      nodes across the three workflows hit them, so without this the first one in
+      every execution fails. Run the **whole file**, not just the `CREATE TABLE`s:
+      the six RPC nodes call functions defined in its second half, and each would
+      return `404 Not Found` for a missing function. It also includes the `UNIQUE`
+      on `faq_summary.question` that `ON CONFLICT` needs and the `pages_visited` /
+      `handoff_requested` columns from plan §10 — no follow-up ALTERs required.
+- [ ] **Set `SUPABASE_URL`** to the project URL (`https://[ref].supabase.co`, no
+      trailing slash). The six RPC nodes build their URL from it; unset, they POST
+      to `/rest/v1/rpc/...` on no host and fail with an invalid-URL error that does
+      not obviously point at a missing variable.
 - [ ] Create the AutoCRM service account as **`admin`** (§2) and set
       `AUTOCRM_SERVICE_EMAIL` / `_PASSWORD` to it
 - [ ] If AutoCRM runs with `DEBUG=False` (i.e. production), `AUTOCRM_BASE_URL`

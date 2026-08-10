@@ -1,0 +1,392 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AI Sales Agent — Test Console</title>
+<!--
+  A test rig, not the product. The product is widget/widget.js, which
+  deliberately hides all of this from visitors.
+
+  Left: the same /api/chat SSE stream the widget consumes.
+  Right: the `debug` frames that stream carries when debug:true is set --
+  retrieval hits with scores, tool arguments and results, the deterministic
+  lead score with its reasons, and which n8n events actually left.
+
+  Same origin as the API, so no CORS. No build step, no framework, no CDN.
+-->
+<style>
+  :root{
+    --ink:#17232e; --muted:#6b7c8f; --line:#e6ebf1; --wash:#f7f9fc;
+    --brand:#0d5cab; --hot:#c0392b; --warm:#b06d17; --cold:#5c7085;
+    --ok:#1e8a4c; --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    margin:0; display:flex; flex-direction:column; background:var(--wash); color:var(--ink);
+    font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+  }
+  header{
+    background:#fff; border-bottom:1px solid var(--line); padding:11px 18px;
+    display:flex; align-items:center; gap:14px; flex-wrap:wrap; flex:none;
+  }
+  h1{font-size:15px; margin:0; font-weight:600}
+  h1 span{color:var(--muted); font-weight:400}
+  .grow{flex:1}
+  .chip{
+    font:12px var(--mono); padding:3px 9px; border-radius:20px;
+    border:1px solid var(--line); background:var(--wash); color:var(--muted);
+  }
+  .chip.live{color:var(--ok); border-color:#bfe6cf; background:#f2fbf6}
+  .chip.down{color:var(--hot); border-color:#f0c9c4; background:#fdf3f2}
+  button,select{font:inherit; padding:6px 11px; border:1px solid #cfd8e3; border-radius:7px; background:#fff; cursor:pointer}
+  button:hover{border-color:var(--brand); color:var(--brand)}
+
+  main{flex:1; display:grid; grid-template-columns:minmax(380px,1fr) minmax(420px,1fr); min-height:0}
+  section{display:flex; flex-direction:column; min-height:0; min-width:0}
+  section + section{border-left:1px solid var(--line)}
+  .bar{
+    padding:8px 14px; border-bottom:1px solid var(--line); background:#fff;
+    font-size:11px; text-transform:uppercase; letter-spacing:.5px; color:var(--muted);
+    font-weight:600; display:flex; align-items:center; gap:10px; flex:none;
+  }
+
+  .log{flex:1; overflow-y:auto; padding:16px 14px}
+  .row{display:flex; margin-bottom:11px}
+  .row.me{justify-content:flex-end}
+  .bub{max-width:84%; padding:10px 13px; border-radius:14px; white-space:pre-wrap; overflow-wrap:anywhere}
+  .them .bub{background:#fff; border:1px solid #e3e9f0; border-bottom-left-radius:5px}
+  .me .bub{background:var(--brand); color:#fff; border-bottom-right-radius:5px}
+  .note{font-size:12.5px; color:var(--muted); text-align:center; padding:4px 12px 8px; font-style:italic}
+  .cursor::after{content:'▍'; opacity:.55; animation:blink 1.05s steps(2,start) infinite}
+  @keyframes blink{50%{opacity:0}}
+
+  form{display:flex; gap:8px; padding:11px; border-top:1px solid var(--line); background:#fff; flex:none}
+  textarea{flex:1; resize:none; max-height:100px; padding:9px 11px; border:1px solid #cfd8e3; border-radius:9px; font:inherit}
+  textarea:focus{outline:2px solid var(--brand); outline-offset:-1px}
+  .send{background:var(--brand); border-color:var(--brand); color:#fff; padding:8px 16px}
+  .send:hover{color:#fff}
+  .send:disabled{opacity:.45; cursor:default}
+
+  .tele{flex:1; overflow-y:auto; padding:12px 14px; font-size:13px}
+  .ev{border:1px solid var(--line); border-radius:9px; background:#fff; margin-bottom:10px; overflow:hidden}
+  .ev > b{
+    display:flex; gap:8px; align-items:center; padding:7px 11px; background:var(--wash);
+    border-bottom:1px solid var(--line); font-size:11px; text-transform:uppercase; letter-spacing:.4px;
+  }
+  .ev > b em{margin-left:auto; font-style:normal; color:var(--muted); font-weight:400; font-family:var(--mono)}
+  .ev .in{padding:9px 11px}
+  table{width:100%; border-collapse:collapse; font-size:12.5px}
+  td{padding:3px 6px; vertical-align:top; border-bottom:1px solid #f2f5f8}
+  tr:last-child td{border-bottom:0}
+  td.p{font-family:var(--mono); color:var(--brand)}
+  td.s{font-family:var(--mono); color:var(--muted); text-align:right; width:56px}
+  pre{margin:0; font:12px/1.45 var(--mono); white-space:pre-wrap; word-break:break-word}
+  .kv{display:grid; grid-template-columns:auto 1fr; gap:2px 10px; font-size:12.5px}
+  .kv i{color:var(--muted); font-style:normal; font-family:var(--mono)}
+  .pill{display:inline-block; padding:1px 8px; border-radius:20px; font-size:11px; font-weight:600; text-transform:uppercase; border:1px solid}
+  .hot{color:var(--hot); border-color:#f0c9c4; background:#fdf3f2}
+  .warm{color:var(--warm); border-color:#f0dcc4; background:#fdf9f2}
+  .cold{color:var(--cold); border-color:#dde4ec; background:var(--wash)}
+  .good{color:var(--ok)} .bad{color:var(--hot)}
+  .empty{color:var(--muted); text-align:center; padding:26px 12px; font-size:13px}
+  .hint{padding:10px 14px; background:#fff; border-bottom:1px solid var(--line); font-size:12.5px; color:var(--muted); flex:none}
+  .hint b{color:var(--ink)}
+  .hint button{padding:3px 8px; font-size:12px; margin:2px 3px 0 0}
+  @media (max-width:900px){ main{grid-template-columns:1fr} section+section{border-left:0; border-top:1px solid var(--line)} }
+</style>
+
+<header>
+  <h1>AI Sales Agent <span>— test console</span></h1>
+  <span class="chip" id="cHealth">checking…</span>
+  <span class="chip" id="cSid">—</span>
+  <div class="grow"></div>
+  <button onclick="endConversation()" title="Fires conversation_ended, as the widget does on unload">End conversation</button>
+  <button onclick="reset()">New session</button>
+</header>
+
+<main>
+  <section>
+    <div class="bar">Conversation <span style="text-transform:none;font-weight:400" id="turnCount"></span></div>
+    <div class="hint">
+      Try: <button onclick="ask(this)">what is local seo?</button>
+      <button onclick="ask(this)">how much does a website cost?</button>
+      <button onclick="ask(this)">I run a shopify store and need more traffic</button>
+      <button onclick="ask(this)">میں ایک ویب سائٹ بنانا چاہتا ہوں</button>
+      <button onclick="ask(this)">I'm Ali from Acme, ali@acme.com, +923001234567</button>
+      <button onclick="ask(this)">can I speak to a human?</button>
+    </div>
+    <div class="log" id="log"></div>
+    <form onsubmit="onSend(event)">
+      <textarea id="msg" rows="1" placeholder="Type as a visitor would…" maxlength="4000" enterkeyhint="send"></textarea>
+      <button class="send" id="send" type="submit">Send</button>
+    </form>
+  </section>
+
+  <section>
+    <div class="bar">Telemetry <span style="text-transform:none;font-weight:400">— what the visitor never sees</span></div>
+    <div class="tele" id="tele"><div class="empty">Send a message to see retrieval, tools, scoring and n8n events.</div></div>
+  </section>
+</main>
+<script>
+const API = location.origin;
+let sid = newSid();
+let streaming = false;
+let turns = 0;
+
+function newSid() { return 'console-' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36); }
+
+// textContent only, never innerHTML with data. The transcript echoes whatever
+// was typed, and the telemetry pane renders tool arguments straight from the
+// model -- both are untrusted strings.
+const el = (tag, cls, text) => {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text !== undefined && text !== null) n.textContent = String(text);
+  return n;
+};
+const $ = id => document.getElementById(id);
+const atBottom = box => box.scrollHeight - box.scrollTop - box.clientHeight < 80;
+
+function bubble(role, text) {
+  const row = el('div', 'row ' + (role === 'user' ? 'me' : 'them'));
+  const b = el('div', 'bub', text);
+  row.append(b);
+  $('log').append(row);
+  $('log').scrollTop = $('log').scrollHeight;
+  return b;
+}
+
+function note(text) {
+  $('log').append(el('div', 'note', text));
+  $('log').scrollTop = $('log').scrollHeight;
+}
+
+// ---------------------------------------------------------------- telemetry
+
+function card(kind, label, tone) {
+  const box = $('tele');
+  if (box.firstElementChild?.className === 'empty') box.textContent = '';
+  const c = el('div', 'ev');
+  const head = el('b', null, label);
+  if (tone) head.classList.add(tone);
+  head.append(el('em', null, new Date().toLocaleTimeString()));
+  c.append(head);
+  const body = el('div', 'in');
+  c.append(body);
+  const stick = atBottom(box);
+  box.append(c);
+  if (stick) box.scrollTop = box.scrollHeight;
+  return body;
+}
+
+function kv(pairs) {
+  const g = el('div', 'kv');
+  for (const [k, v] of pairs) {
+    if (v === undefined || v === null || v === '' ||
+        (Array.isArray(v) && !v.length)) continue;
+    g.append(el('i', null, k), el('span', null, Array.isArray(v) ? v.join(', ') : v));
+  }
+  return g;
+}
+
+function onRetrieval(d) {
+  const body = card('retrieval', `retrieval — ${d.hits.length} chunks, ${d.chars} chars`);
+  if (!d.hits.length) {
+    body.append(el('div', 'bad', 'no chunks above the score floor'));
+    return;
+  }
+  const t = el('table');
+  for (const h of d.hits) {
+    const tr = el('tr');
+    tr.append(el('td', 'p', h.path), el('td', 's', h.score.toFixed(3)));
+    t.append(tr);
+  }
+  body.append(t);
+}
+
+function onTool(d) {
+  const body = card('tool', 'tool — ' + d.name);
+  const args = Object.entries(d.args || {}).filter(([, v]) => v !== null && v !== '');
+  if (args.length) body.append(kv(args));
+  // Tool results are instructions addressed to the model, never shown to a
+  // visitor. ASK: means the tool refused and asked for more; SAVED/BOOKED mean
+  // it did the thing. Seeing the raw string is the point of this pane.
+  const pre = el('pre', null, d.result);
+  if (/^(ASK|FAILED)/.test(d.result)) pre.classList.add('bad');
+  else if (/^(SAVED|BOOKED)/.test(d.result)) pre.classList.add('good');
+  body.append(pre);
+}
+
+function onSummary(d) {
+  const body = card('summary', `turn complete — ${d.elapsed_ms} ms`);
+
+  const grade = el('span', 'pill ' + d.score.status, `${d.score.status} · ${d.score.points} pts`);
+  const line = el('div');
+  line.style.marginBottom = '7px';
+  line.append(grade);
+  body.append(line);
+
+  if (d.score.reasons?.length) {
+    // The reasons ARE the evidence that scoring is deterministic code and not
+    // a model judgement call.
+    body.append(el('pre', null, d.score.reasons.join('\n')));
+  }
+
+  const flags = [];
+  if (d.meeting_booked) flags.push('meeting booked');
+  if (d.proposal_requested) flags.push('proposal requested');
+  if (d.handoff_requested) flags.push('handoff requested');
+
+  body.append(kv([
+    ['fields', Object.entries(d.fields || {}).map(([k, v]) => `${k}=${v}`)],
+    ['actions', d.actions_taken],
+    ['pages', d.pages_visited],
+    ['flags', flags],
+  ]));
+
+  if (d.n8n_events?.length) {
+    const t = el('table');
+    for (const e of d.n8n_events) {
+      const tr = el('tr');
+      const st = el('td', 's', e.status);
+      st.classList.add(/^http_2/.test(e.status) ? 'good' : 'bad');
+      tr.append(el('td', 'p', 'n8n → ' + e.event_type), st);
+      t.append(tr);
+    }
+    body.append(t);
+  }
+}
+
+// ------------------------------------------------------------------ stream
+
+async function send(text) {
+  if (streaming) return;
+  streaming = true;
+  $('send').disabled = true;
+  turns++;
+  $('turnCount').textContent = `· ${turns} turn${turns === 1 ? '' : 's'}`;
+
+  bubble('user', text);
+  const bub = bubble('assistant', '');
+  bub.classList.add('cursor');
+  let answer = '';
+
+  try {
+    const res = await fetch(API + '/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: text, session_id: sid, page_path: '/', debug: true }),
+    });
+    if (!res.ok || !res.body) throw new Error('HTTP ' + res.status);
+
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+
+      // Frames are \n\n-delimited; the tail may be a partial frame.
+      const frames = buf.split('\n\n');
+      buf = frames.pop() ?? '';
+
+      for (const frame of frames) {
+        let name = 'message';
+        const data = [];
+        for (const l of frame.split('\n')) {
+          if (l.startsWith('event:')) name = l.slice(6).trim();
+          else if (l.startsWith('data:')) data.push(l.slice(5).trim());
+        }
+        if (!data.length) continue;
+        let p;
+        try { p = JSON.parse(data.join('\n')); } catch { continue; }
+
+        if (name === 'token' && p.text) {
+          answer += p.text;
+          bub.textContent = answer;
+          const box = $('log');
+          if (atBottom(box)) box.scrollTop = box.scrollHeight;
+        } else if (name === 'debug') {
+          if (p.kind === 'retrieval') onRetrieval(p);
+          else if (p.kind === 'tool') onTool(p);
+          else if (p.kind === 'summary') onSummary(p);
+        } else if (name === 'handoff') {
+          note('→ handoff to human requested');
+        } else if (name === 'error') {
+          throw new Error(p.message || 'stream error');
+        }
+      }
+    }
+  } catch (err) {
+    if (!answer) { answer = '[stream failed] ' + err.message; bub.textContent = answer; }
+    card('error', 'stream error').append(el('pre', 'bad', String(err.message)));
+  } finally {
+    bub.classList.remove('cursor');
+    streaming = false;
+    $('send').disabled = false;
+    $('msg').focus();
+  }
+}
+
+function onSend(e) {
+  e.preventDefault();
+  const t = $('msg').value.trim();
+  if (!t) return;
+  $('msg').value = '';
+  $('msg').style.height = 'auto';
+  send(t);
+}
+
+function ask(btn) {
+  if (streaming) return;
+  send(btn.textContent);
+}
+
+async function endConversation() {
+  // Same call the widget makes on pagehide. Fires conversation_ended at n8n
+  // and stamps ended_at / duration_ms on the agent_runs row.
+  await fetch(API + '/api/end', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ session_id: sid }),
+  });
+  note('conversation ended — conversation_ended emitted');
+}
+
+function reset() {
+  sid = newSid();
+  turns = 0;
+  $('log').textContent = '';
+  $('turnCount').textContent = '';
+  $('tele').textContent = '';
+  $('tele').append(el('div', 'empty', 'Send a message to see retrieval, tools, scoring and n8n events.'));
+  $('cSid').textContent = sid;
+}
+
+async function health() {
+  const chip = $('cHealth');
+  try {
+    const h = await (await fetch(API + '/api/health')).json();
+    chip.textContent = `${h.model} · ${h.indexed_chunks} chunks · prompt ${h.kb_tokens} tok`;
+    chip.className = 'chip ' + (h.status === 'ok' ? 'live' : 'down');
+  } catch {
+    chip.textContent = 'api unreachable';
+    chip.className = 'chip down';
+  }
+}
+
+$('msg').addEventListener('input', e => {
+  e.target.style.height = 'auto';
+  e.target.style.height = Math.min(e.target.scrollHeight, 100) + 'px';
+});
+$('msg').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); onSend(e); }
+});
+
+$('cSid').textContent = sid;
+health();
+$('msg').focus();
+</script>
+

@@ -2,3 +2,10 @@
 venv/
 __pycache__/
 *.pyc
+/kb/raw/*
+*.md
+sitemap.json
+*.pdf
+
+# Build artifact -- rebuild with: python kb/chunk.py && python kb/embed.py
+/kb/index/

@@ -1,0 +1,375 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AI Sales Agent — Leads</title>
+<!--
+  One file, no build, no framework, no CDN. It reads five JSON endpoints and
+  renders tables; a bundler would be more setup than code.
+
+  The token lives in sessionStorage, not localStorage: it dies with the tab
+  instead of sitting on disk until someone clears site data.
+-->
+<style>
+  :root{
+    --ink:#17232e; --muted:#6b7c8f; --line:#e6ebf1; --wash:#f7f9fc;
+    --brand:#0d5cab; --hot:#c0392b; --warm:#b06d17; --cold:#5c7085; --ok:#46d67f;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:var(--wash); color:var(--ink);
+    font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+  }
+  header{
+    background:#fff; border-bottom:1px solid var(--line); padding:16px 24px;
+    display:flex; align-items:center; gap:16px; flex-wrap:wrap;
+    position:sticky; top:0; z-index:5;
+  }
+  h1{font-size:17px; margin:0; font-weight:600}
+  h1 small{color:var(--muted); font-weight:400; margin-left:8px}
+  main{padding:24px; max-width:1400px; margin:0 auto}
+  .row{display:flex; gap:12px; align-items:center; flex-wrap:wrap}
+  .grow{flex:1}
+  button, select, input{
+    font:inherit; padding:7px 12px; border:1px solid #cfd8e3;
+    border-radius:7px; background:#fff; color:var(--ink);
+  }
+  button{cursor:pointer}
+  button:hover{border-color:var(--brand); color:var(--brand)}
+  button.primary{background:var(--brand); border-color:var(--brand); color:#fff}
+  .tiles{display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px; margin-bottom:20px}
+  .tile{background:#fff; border:1px solid var(--line); border-radius:10px; padding:14px 16px}
+  .tile b{display:block; font-size:26px; font-weight:600; letter-spacing:-.5px}
+  .tile span{color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.4px}
+  .tile em{display:block; color:var(--muted); font-size:11px; font-style:normal; margin-top:3px}
+  .card{background:#fff; border:1px solid var(--line); border-radius:10px; margin-bottom:20px; overflow:hidden}
+  .card > h2{
+    font-size:13px; margin:0; padding:12px 16px; border-bottom:1px solid var(--line);
+    text-transform:uppercase; letter-spacing:.5px; color:var(--muted); font-weight:600;
+  }
+  table{width:100%; border-collapse:collapse; font-size:14px}
+  th{
+    text-align:left; font-size:11px; text-transform:uppercase; letter-spacing:.4px;
+    color:var(--muted); padding:9px 12px; border-bottom:1px solid var(--line); white-space:nowrap;
+  }
+  td{padding:9px 12px; border-bottom:1px solid #f0f3f7; vertical-align:top}
+  tr:last-child td{border-bottom:0}
+  tbody tr:hover{background:var(--wash); cursor:pointer}
+  .pill{
+    display:inline-block; padding:1px 8px; border-radius:20px; font-size:11px;
+    font-weight:600; text-transform:uppercase; letter-spacing:.3px; border:1px solid;
+  }
+  .hot{color:var(--hot); border-color:#f0c9c4; background:#fdf3f2}
+  .warm{color:var(--warm); border-color:#f0dcc4; background:#fdf9f2}
+  .cold{color:var(--cold); border-color:#dde4ec; background:#f7f9fc}
+  .tick{color:#1e8a4c; font-weight:600}
+  .no{color:#c3ccd6}
+  .muted{color:var(--muted)}
+  .err{color:var(--hot); font-size:12px}
+  .empty{padding:28px 16px; text-align:center; color:var(--muted)}
+  dialog{
+    border:0; border-radius:12px; padding:0; max-width:820px; width:92vw;
+    box-shadow:0 18px 50px rgba(23,35,46,.28);
+  }
+  dialog::backdrop{background:rgba(23,35,46,.45)}
+  dialog h3{margin:0; padding:14px 18px; border-bottom:1px solid var(--line); font-size:15px}
+  .dbody{padding:18px; max-height:66vh; overflow:auto}
+  .kv{display:grid; grid-template-columns:150px 1fr; gap:6px 14px; font-size:14px; margin-bottom:18px}
+  .kv div:nth-child(odd){color:var(--muted)}
+  pre{
+    background:var(--wash); border:1px solid var(--line); border-radius:8px;
+    padding:12px; white-space:pre-wrap; word-break:break-word; font-size:13px; margin:0;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+  }
+  .gate{max-width:380px; margin:14vh auto; text-align:center}
+  .gate .card{padding:22px}
+  .gate input{width:100%; margin:14px 0 10px}
+</style>
+
+<div id="gate" class="gate" hidden>
+  <div class="card">
+    <h2>Dashboard access</h2>
+    <div style="padding:18px">
+      <p class="muted" style="margin:0;font-size:13px">Enter the dashboard token.</p>
+      <input id="tok" type="password" placeholder="X-Dashboard-Token" autocomplete="off">
+      <button class="primary" style="width:100%" onclick="signIn()">Open</button>
+      <p id="gateErr" class="err"></p>
+    </div>
+  </div>
+</div>
+
+<div id="app" hidden>
+  <header>
+    <h1>AI Sales Agent <small id="sub">leads &amp; meetings</small></h1>
+    <div class="grow"></div>
+    <div class="row">
+      <select id="fStatus" onchange="loadRuns()">
+        <option value="">all grades</option>
+        <option value="hot">hot</option>
+        <option value="warm">warm</option>
+        <option value="cold">cold</option>
+      </select>
+      <select id="fBooked" onchange="loadRuns()">
+        <option value="">booked or not</option>
+        <option value="true">booked</option>
+        <option value="false">not booked</option>
+      </select>
+      <button onclick="refresh()">Refresh</button>
+      <button onclick="signOut()">Lock</button>
+    </div>
+  </header>
+
+  <main>
+    <div class="tiles" id="tiles"></div>
+
+    <div class="card">
+      <h2>Conversations</h2>
+      <div id="runs"><div class="empty">loading…</div></div>
+    </div>
+
+    <div class="row" style="align-items:flex-start; gap:20px">
+      <div class="card grow" style="min-width:280px">
+        <h2>Popular services</h2>
+        <div id="services"><div class="empty">loading…</div></div>
+      </div>
+      <div class="card grow" style="min-width:280px">
+        <h2>Common questions</h2>
+        <div id="faq"><div class="empty">loading…</div></div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<dialog id="detail">
+  <h3 id="dTitle">Conversation</h3>
+  <div class="dbody" id="dBody"></div>
+  <div style="padding:12px 18px; border-top:1px solid var(--line); text-align:right">
+    <button onclick="detail.close()">Close</button>
+  </div>
+</dialog>
+<script>
+const KEY = 'sysit_dash_token';
+const API = location.origin + '/api/dashboard';
+let token = sessionStorage.getItem(KEY) || '';
+
+// textContent everywhere, never innerHTML with data. Visitor names, companies
+// and transcripts are attacker-controlled strings that arrive from a public
+// chat endpoint -- interpolating them into markup is a stored-XSS delivery
+// mechanism aimed at whoever reads this page.
+const el = (tag, cls, text) => {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text !== undefined && text !== null) n.textContent = String(text);
+  return n;
+};
+const show = (id, on) => document.getElementById(id).hidden = !on;
+
+async function api(path) {
+  const res = await fetch(API + path, { headers: { 'X-Dashboard-Token': token } });
+  if (res.status === 401) { signOut('Token rejected.'); throw new Error('401'); }
+  if (res.status === 503) throw new Error('DASHBOARD_TOKEN is not set on the server');
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  return res.json();
+}
+
+function signIn() {
+  token = document.getElementById('tok').value.trim();
+  if (!token) return;
+  sessionStorage.setItem(KEY, token);
+  boot();
+}
+
+function signOut(msg) {
+  token = '';
+  sessionStorage.removeItem(KEY);
+  show('app', false); show('gate', true);
+  document.getElementById('gateErr').textContent = msg || '';
+}
+
+const pct = n => (n * 100).toFixed(1) + '%';
+const when = s => s ? new Date(s).toLocaleString(undefined,
+  { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—';
+const mins = ms => ms ? (ms < 60000 ? Math.round(ms / 1000) + 's'
+                                    : Math.round(ms / 60000) + 'm') : '—';
+
+function tile(label, value, note) {
+  const t = el('div', 'tile');
+  t.append(el('span', null, label), el('b', null, value));
+  if (note) t.append(el('em', null, note));
+  return t;
+}
+
+async function loadStats() {
+  const s = await api('/stats');
+  const box = document.getElementById('tiles');
+  box.textContent = '';
+  box.append(
+    tile('Conversations', s.conversations),
+    tile('Leads', s.leads, pct(s.lead_rate) + ' of conversations'),
+    tile('Meetings', s.meetings, pct(s.conversion_rate) + ' of leads'),
+    tile('Proposals', s.proposals),
+    tile('Hot / Warm / Cold', `${s.hot} / ${s.warm} / ${s.cold}`),
+    tile('CRM synced', s.crm_synced, s.errored ? s.errored + ' with errors' : 'no errors'),
+  );
+  document.getElementById('sub').textContent =
+    `${s.meetings} meeting${s.meetings === 1 ? '' : 's'} from ${s.leads} lead${s.leads === 1 ? '' : 's'}`;
+}
+
+function grade(status) {
+  if (!status) return el('span', 'no', '—');
+  return el('span', 'pill ' + status, status);
+}
+
+// Build a <thead> from column labels. Written out rather than chained:
+// `table.append(el('thead')).firstChild` looks tidy and does not work --
+// append() returns undefined, so the chain reads firstChild of nothing.
+function thead(labels) {
+  const head = el('thead'), tr = el('tr');
+  labels.forEach(l => tr.append(el('th', null, l)));
+  head.append(tr);
+  return head;
+}
+
+function cell(cls, node) {
+  const td = el('td', cls);
+  td.append(node);
+  return td;
+}
+
+async function loadRuns() {
+  const q = new URLSearchParams();
+  const st = document.getElementById('fStatus').value;
+  const bk = document.getElementById('fBooked').value;
+  if (st) q.set('lead_status', st);
+  if (bk) q.set('booked', bk);
+  const data = await api('/runs?' + q);
+  const box = document.getElementById('runs');
+  box.textContent = '';
+
+  if (!data.items.length) {
+    box.append(el('div', 'empty', 'No conversations match.'));
+    return;
+  }
+
+  const table = el('table');
+  table.append(thead(
+    ['When', 'Visitor', 'Company', 'Contact', 'Service', 'Grade', 'Booked', 'Msgs', 'Time', 'CRM']
+  ));
+
+  const body = el('tbody');
+  for (const r of data.items) {
+    const tr = el('tr');
+    tr.onclick = () => openDetail(r.session_id);
+    tr.append(
+      el('td', 'muted', when(r.started_at)),
+      el('td', null, r.visitor_name || '—'),
+      el('td', null, r.company_name || '—'),
+      el('td', 'muted', r.visitor_email || r.visitor_phone || '—'),
+      el('td', 'muted', r.service_recommended || '—'),
+      cell(null, grade(r.lead_status)),
+      el('td', r.meeting_booked ? 'tick' : 'no', r.meeting_booked ? 'yes' : '—'),
+      el('td', 'muted', r.messages_count ?? 0),
+      el('td', 'muted', mins(r.duration_ms)),
+    );
+    const crm = el('td', r.crm_synced ? 'tick' : 'no', r.crm_synced ? 'ok' : '—');
+    if (r.error) crm.append(el('div', 'err', 'error'));
+    tr.append(crm);
+    body.append(tr);
+  }
+  table.append(body);
+  box.append(table);
+}
+
+function simpleTable(rows, cols, emptyMsg) {
+  if (!rows.length) return el('div', 'empty', emptyMsg);
+  const t = el('table');
+  t.append(thead(cols.map(c => c.label)));
+  const b = el('tbody');
+  rows.forEach(r => {
+    const tr = el('tr');
+    cols.forEach(c => tr.append(el('td', c.cls, c.get(r))));
+    b.append(tr);
+  });
+  t.append(b);
+  return t;
+}
+
+async function loadServices() {
+  const rows = await api('/services');
+  const box = document.getElementById('services');
+  box.textContent = '';
+  box.append(simpleTable(rows, [
+    { label: 'Service', get: r => r.service },
+    { label: 'Runs', cls: 'muted', get: r => r.runs },
+    { label: 'Meetings', cls: 'muted', get: r => r.meetings },
+  ], 'No service recommended yet.'));
+}
+
+async function loadFaq() {
+  const rows = await api('/faq');
+  const box = document.getElementById('faq');
+  box.textContent = '';
+  box.append(simpleTable(rows, [
+    { label: 'Question', get: r => r.question },
+    { label: 'Times', cls: 'muted', get: r => r.frequency },
+  ], 'Nothing clustered yet — the nightly n8n job has not run.'));
+}
+
+async function openDetail(sessionId) {
+  const r = await api('/runs/' + encodeURIComponent(sessionId));
+  document.getElementById('dTitle').textContent =
+    (r.visitor_name || 'Visitor') + (r.company_name ? ' — ' + r.company_name : '');
+
+  const body = document.getElementById('dBody');
+  body.textContent = '';
+
+  const kv = el('div', 'kv');
+  const pairs = [
+    ['Session', r.session_id], ['Started', when(r.started_at)],
+    ['Ended', when(r.ended_at)], ['Duration', mins(r.duration_ms)],
+    ['Email', r.visitor_email], ['Phone', r.visitor_phone],
+    ['Website', r.website_url], ['Industry', r.industry],
+    ['Grade', r.lead_status], ['Service', r.service_recommended],
+    ['Meeting', r.meeting_booked ? when(r.meeting_start_at) : 'not booked'],
+    ['CRM lead', r.crm_lead_id], ['Pages', (r.pages_visited || []).join(' → ')],
+    ['Actions', (r.actions_taken || []).join(', ')],
+  ];
+  for (const [k, v] of pairs) {
+    if (v === null || v === undefined || v === '') continue;
+    kv.append(el('div', null, k), el('div', null, v));
+  }
+  body.append(kv);
+
+  if (r.error) {
+    body.append(el('div', 'err', 'Error: ' + r.error));
+  }
+
+  const turns = Array.isArray(r.transcript) ? r.transcript : [];
+  body.append(el('div', 'muted', `Transcript (${turns.length} turns)`));
+  body.append(el('pre', null,
+    turns.map(t => `${t.role}: ${t.content}`).join('\n\n') || '(empty)'));
+
+  document.getElementById('detail').showModal();
+}
+
+async function refresh() {
+  await Promise.all([loadStats(), loadRuns(), loadServices(), loadFaq()]);
+}
+
+async function boot() {
+  if (!token) { show('gate', true); show('app', false); return; }
+  show('gate', false); show('app', true);
+  try {
+    await refresh();
+  } catch (err) {
+    if (String(err.message) !== '401') {
+      show('app', false); show('gate', true);
+      document.getElementById('gateErr').textContent = err.message;
+    }
+  }
+}
+
+document.getElementById('tok')
+  .addEventListener('keydown', e => { if (e.key === 'Enter') signIn(); });
+boot();
+</script>
+

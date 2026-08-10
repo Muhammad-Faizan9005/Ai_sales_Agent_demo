@@ -1,5 +1,5 @@
 {
-  "name": "sales-agent-error-handler",
+  "name": "sales-agent-error-handler (local)",
   "nodes": [
     {
       "parameters": {},
@@ -78,8 +78,8 @@
       "typeVersion": 4.2,
       "credentials": {
         "supabaseApi": {
-          "id": "REPLACE_SUPABASE_CRED_ID",
-          "name": "AI Sales Agent Supabase"
+          "id": "szox4UWsZWBiuv2V",
+          "name": "Supabase account"
         }
       },
       "notes": "Shares record_run_error with the events workflow.",
@@ -116,7 +116,7 @@
       ],
       "credentials": {
         "mailjetEmailApi": {
-          "id": "REPLACE_MAILJET_CRED_ID",
+          "id": "6ApVgdiLsjekE01f",
           "name": "Mailjet Email account"
         }
       },
