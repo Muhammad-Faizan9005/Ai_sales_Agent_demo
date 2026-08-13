@@ -105,8 +105,24 @@ async def run_turn(
     page_path: str | None = None,
     debug: bool = False,
 ) -> AsyncIterator[str]:
-    """Handle one visitor message, yielding SSE frames."""
+    """Serialize a full turn for one session, including all side effects."""
     session = SESSIONS.get(session_id)
+    async with session.turn_lock:
+        session.finalised = False
+        session.ended_at = None
+        session.touch()
+        async for frame in _run_turn_locked(message, session, page_path, debug):
+            yield frame
+
+
+async def _run_turn_locked(
+    message: str,
+    session: Session,
+    page_path: str | None = None,
+    debug: bool = False,
+) -> AsyncIterator[str]:
+    """Handle one visitor message while its per-session lock is held."""
+    session_id = session.session_id
     session.add("user", message)
     if page_path and page_path not in session.pages:
         session.pages.append(page_path)
@@ -161,7 +177,6 @@ async def run_turn(
             async for delta in stream_turn(messages, tools=TOOL_SCHEMAS):
                 if delta.text:
                     spoken.append(delta.text)
-                    yield _sse("token", {"text": delta.text})
                 if delta.tool_calls:
                     pending_calls.extend(delta.tool_calls)
                 if delta.done:
@@ -172,6 +187,11 @@ async def run_turn(
             if not pending_calls:
                 if assistant_text:
                     session.add("assistant", assistant_text)
+                    # Text is released only after we know this model response
+                    # contains no tool call. This prevents unverified claims
+                    # such as "booked" reaching the visitor before Cal.com.
+                    for text in spoken:
+                        yield _sse("token", {"text": text})
                 break
 
             # Record the assistant turn that requested the tools, so the model
@@ -269,24 +289,45 @@ def _finalise(session: Session):
     return score
 
 
-def end_conversation(session_id: str) -> None:
-    """Called on widget unload so the FAQ job sees a complete transcript."""
-    session = SESSIONS.get(session_id)
-    if not session.messages:
-        return
+def _end_conversation_locked(session: Session) -> bool:
+    """Finalize a session while its turn lock is held. Returns whether it changed."""
+    if not session.messages or session.finalised:
+        return False
     session.ended_at = datetime.now(timezone.utc)
+    session.finalised = True
     _finalise(session)
     n8n_client.emit_event(
         "conversation_ended",
-        session_id,
+        session.session_id,
         {
             "message_count": len(session.messages),
-            # transcript_text, not transcript: the other three events all use
-            # this key and the workflow reads body.transcript_text. A private
-            # spelling here meant the branch would find nothing once routed.
             "transcript_text": session.transcript_text(),
             "pages_visited": list(session.pages),
             "ended_at": session.ended_at.isoformat().replace("+00:00", "Z"),
             "duration_ms": session.duration_ms(),
         },
     )
+    return True
+
+
+async def end_conversation(session_id: str) -> bool:
+    """Explicitly finalize without racing an in-flight turn."""
+    session = SESSIONS.get(session_id)
+    async with session.turn_lock:
+        return _end_conversation_locked(session)
+
+
+async def finalise_idle_sessions(idle_seconds: int) -> int:
+    """Finalize and evict sessions inactive for the configured TTL."""
+    now = datetime.now(timezone.utc)
+    finalised = 0
+    for session in SESSIONS.snapshot():
+        if (now - session.last_activity_at).total_seconds() < idle_seconds:
+            continue
+        if session.turn_lock.locked():
+            continue
+        async with session.turn_lock:
+            if session.messages and not session.finalised:
+                finalised += int(_end_conversation_locked(session))
+            SESSIONS.drop(session.session_id)
+    return finalised

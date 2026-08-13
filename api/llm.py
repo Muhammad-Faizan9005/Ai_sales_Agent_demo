@@ -56,7 +56,11 @@ async def stream_turn(
         "options": {
             # Low but not zero: consistent sales language, still natural.
             "temperature": 0.4,
-            "num_ctx": 65536,
+            # The prompt plus retrieved excerpts and 20-turn history fit well
+            # below 16k. Asking Ollama for 65k makes every generation slower
+            # without improving this agent's answers. Keep it configurable for
+            # deployments with a larger model/context budget.
+            "num_ctx": SETTINGS.llm_num_ctx,
         },
     }
     if tools:

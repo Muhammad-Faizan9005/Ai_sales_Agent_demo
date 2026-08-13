@@ -58,7 +58,21 @@ async def lifespan(_: FastAPI):
         log.warning("Ollama unreachable at %s -- chat will degrade", SETTINGS.ollama_base_url)
     if not ready:
         log.warning("No FAISS index -- run: python kb/chunk.py && python kb/embed.py")
+    async def reap_idle_sessions() -> None:
+        idle_seconds = max(1, SETTINGS.session_idle_minutes) * 60
+        while True:
+            await asyncio.sleep(min(60, idle_seconds))
+            count = await chat_module.finalise_idle_sessions(idle_seconds)
+            if count:
+                log.info("finalised %d idle sales-agent sessions", count)
+
+    reaper = asyncio.create_task(reap_idle_sessions())
     yield
+    reaper.cancel()
+    try:
+        await reaper
+    except asyncio.CancelledError:
+        pass
     # Let queued n8n emits land rather than dropping them on restart.
     await n8n_client.flush()
 
@@ -103,7 +117,7 @@ async def post_chat(request: ChatRequest) -> StreamingResponse:
 async def post_end(payload: dict) -> dict:
     session_id = str(payload.get("session_id") or "").strip()
     if session_id:
-        chat_module.end_conversation(session_id)
+        await chat_module.end_conversation(session_id)
     return {"ok": True}
 
 

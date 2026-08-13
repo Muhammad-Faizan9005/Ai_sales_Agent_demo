@@ -410,21 +410,9 @@
     }
   }
 
-  // Best-effort session close so the server can finalise + emit its event.
-  // keepalive lets the request outlive the document being torn down.
-  addEventListener('pagehide', () => {
-    if (!state.turns.length) return;
-    try {
-      fetch(API + '/api/end', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ session_id: state.sid }),
-        keepalive: true,
-      }).catch(() => {});
-    } catch {
-      /* ignore */
-    }
-  });
+  // Conversation completion is server-owned and based on inactivity. Browser
+  // unload events cannot distinguish navigation, refresh, back/forward and a
+  // genuinely closed tab, so finalising here corrupts multi-page sessions.
 
   // ----------------------------------------------------------------- mount
 

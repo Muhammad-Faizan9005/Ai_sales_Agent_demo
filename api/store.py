@@ -17,6 +17,7 @@ the visitor-facing product down with it.
 from __future__ import annotations
 
 import json
+import asyncio
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -42,11 +43,19 @@ class Session:
     proposal_requested: bool = False
     handoff_requested: bool = False
     cal_booking_uid: str | None = None
+    # A corrected slot proposed by the server (for example, weekend -> next
+    # Monday at the same time). It is never booked until the visitor explicitly
+    # confirms it in a later turn.
+    pending_meeting_start: str | None = None
+    pending_meeting_label: str | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     # Set by chat.end_conversation on widget unload. Until then the row is a
     # live conversation and ended_at stays NULL, which is how the dashboard
     # tells "in progress" from "finished".
     ended_at: datetime | None = None
+    last_activity_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    turn_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    finalised: bool = False
 
     def duration_ms(self) -> int:
         """Wall-clock length of the conversation so far."""
@@ -55,6 +64,10 @@ class Session:
 
     def add(self, role: str, content: str, **extra: Any) -> None:
         self.messages.append({"role": role, "content": content, **extra})
+        self.touch()
+
+    def touch(self) -> None:
+        self.last_activity_at = datetime.now(timezone.utc)
 
     def history(self) -> list[dict[str, Any]]:
         """Recent turns, trimmed. Tool plumbing is stripped for the transcript."""
@@ -98,6 +111,10 @@ class SessionStore:
     def count(self) -> int:
         with self._lock:
             return len(self._sessions)
+
+    def snapshot(self) -> list[Session]:
+        with self._lock:
+            return list(self._sessions.values())
 
 
 SESSIONS = SessionStore()

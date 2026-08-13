@@ -1,8 +1,8 @@
 """Tool schemas sent to the model, plus the request/response models.
 
-Descriptions are prompt surface, not documentation -- they are what makes the
-model call `check_page` before naming a URL and `save_lead` before the
-conversation ends, so they read as instructions to the caller.
+Descriptions are prompt surface, not documentation. Read-only website paths are
+provided by the validated server prompt; tools are reserved for business side
+effects such as saving leads and changing bookings.
 """
 
 from __future__ import annotations
@@ -15,10 +15,10 @@ TOOL_SCHEMAS: list[dict] = [
         "function": {
             "name": "save_lead",
             "description": (
-                "Save the visitor's contact and qualification details. Call this as "
-                "soon as you have a name plus an email or phone -- do not wait for "
-                "the end of the conversation. Call it again with new fields as you "
-                "learn more."
+                "Progressively save all seven required lead fields: full name, "
+                "company name, email, phone, website URL (or 'no website'), business "
+                "industry, and required service. Keep qualifying until this tool "
+                "reports QUALIFIED. Do not offer or book a meeting before then."
             ),
             "parameters": {
                 "type": "object",
@@ -42,10 +42,15 @@ TOOL_SCHEMAS: list[dict] = [
         "function": {
             "name": "book_meeting",
             "description": (
-                "Book the call with a sales rep at the time the visitor asked for. "
-                "There is no slot list: ask which day and rough time suits them in "
-                "the next 3 days, then pass their words straight through as "
-                "preferred_time. Requires their email."
+                "Book a NEW call at the time the visitor asked for. Only when they "
+                "have no meeting yet -- if one exists, use reschedule_meeting "
+                "instead, or you will create a second meeting. "
+                "Requires all seven lead fields to be saved first: name, company, "
+                "email, phone, website/no website, industry and required service. "
+                "Only then ask which day and rough time suits them in the next 3 "
+                "working days, then pass their words through unchanged. "
+                "If the result says SLOT_TAKEN, offer the alternatives it gives "
+                "and WAIT for the visitor to choose -- never pick for them."
             ),
             "parameters": {
                 "type": "object",
@@ -54,8 +59,13 @@ TOOL_SCHEMAS: list[dict] = [
                         "type": "string",
                         "description": (
                             "The visitor's own words for when they want the call, "
-                            "e.g. 'tomorrow at 3pm', 'Thursday morning', 'today 4'. "
-                            "Do not convert to a timestamp."
+                            "e.g. 'tomorrow at 3pm', '12 August at 3:30 pm', "
+                            "'Thursday morning'. Do not convert to a timestamp, and "
+                            "never invent a time they did not say. If the previous "
+                            "tool result proposed a corrected weekend slot and the "
+                            "visitor explicitly agrees, pass their confirmation "
+                            "word such as 'yes' unchanged; the server resolves the "
+                            "stored proposal."
                         ),
                     },
                     "visitor_name": {"type": "string"},
@@ -66,7 +76,58 @@ TOOL_SCHEMAS: list[dict] = [
                         "description": "What they want to discuss, for the rep.",
                     },
                 },
-                "required": ["preferred_time", "visitor_email"],
+                "required": ["preferred_time"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "reschedule_meeting",
+            "description": (
+                "Move the visitor's EXISTING meeting to a new time. Use this "
+                "whenever they already have a booking and want a different slot -- "
+                "calling book_meeting again would leave two meetings on the "
+                "calendar. Same rule as booking: if the result says SLOT_TAKEN, "
+                "offer the alternatives and wait for them to choose. Their "
+                "original meeting stays put until they agree to a new time."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "preferred_time": {
+                        "type": "string",
+                        "description": (
+                            "The visitor's own words for the NEW time, e.g. "
+                            "'Thursday at 4' or '13 August at 11am'."
+                        ),
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Why they are moving it, if they said.",
+                    },
+                },
+                "required": ["preferred_time"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cancel_meeting",
+            "description": (
+                "Cancel the visitor's existing meeting. Only on an explicit "
+                "request to cancel -- if they want a different time instead, use "
+                "reschedule_meeting."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "description": "Why they are cancelling, if they said.",
+                    },
+                },
             },
         },
     },
@@ -108,24 +169,6 @@ TOOL_SCHEMAS: list[dict] = [
                 "properties": {
                     "reason": {"type": "string", "description": "Why you're escalating."}
                 },
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "check_page",
-            "description": (
-                "Verify a site path exists before you mention it. Call this whenever "
-                "you are about to point the visitor at a page. The site has no "
-                "pricing page."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "e.g. /seo/local-seo"}
-                },
-                "required": ["path"],
             },
         },
     },

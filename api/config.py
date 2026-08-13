@@ -53,6 +53,9 @@ class Settings(BaseSettings):
     llm_timeout_seconds: int = Field(
         default=120, validation_alias=AliasChoices("LLM_TIMEOUT_SECONDS")
     )
+    llm_num_ctx: int = Field(
+        default=16384, validation_alias=AliasChoices("LLM_NUM_CTX")
+    )
 
     # ---- Retrieval (FAISS + local embeddings) ------------------------------
     # The KB no longer rides in the system prompt. Ollama serves minimax-m3
@@ -130,6 +133,9 @@ class Settings(BaseSettings):
     # Where uvicorn binds. Kept here so main.py's docstring, the widget default
     # and the run command cannot drift apart again.
     api_port: int = Field(default=8002, validation_alias=AliasChoices("API_PORT"))
+    session_idle_minutes: int = Field(
+        default=30, validation_alias=AliasChoices("SESSION_IDLE_MINUTES")
+    )
 
     @property
     def origins(self) -> list[str]:

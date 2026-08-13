@@ -2,7 +2,6 @@
 venv/
 __pycache__/
 *.pyc
-/kb/raw/*
 *.md
 sitemap.json
 *.pdf

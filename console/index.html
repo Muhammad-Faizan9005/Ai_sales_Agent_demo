@@ -128,7 +128,10 @@
   </section>
 </main>
 <script>
-const API = location.origin;
+// FastAPI serves this page at /console on port 8002. When opened directly or
+// from another dev server, location.origin is not the agent API.
+const servedByAgent = /^https?:$/.test(location.protocol) && location.port === '8002';
+const API = window.SALES_AGENT_API || (servedByAgent ? location.origin : 'http://localhost:8002');
 let sid = newSid();
 let streaming = false;
 let turns = 0;
@@ -367,12 +370,19 @@ function reset() {
 
 async function health() {
   const chip = $('cHealth');
+  if (!servedByAgent && !window.SALES_AGENT_API) {
+    chip.textContent = 'open http://localhost:8002/console';
+    chip.className = 'chip down';
+    return;
+  }
   try {
-    const h = await (await fetch(API + '/api/health')).json();
+    const res = await fetch(API + '/api/health');
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const h = await res.json();
     chip.textContent = `${h.model} · ${h.indexed_chunks} chunks · prompt ${h.kb_tokens} tok`;
     chip.className = 'chip ' + (h.status === 'ok' ? 'live' : 'down');
-  } catch {
-    chip.textContent = 'api unreachable';
+  } catch (err) {
+    chip.textContent = `api unreachable (${err.message})`;
     chip.className = 'chip down';
   }
 }
@@ -389,4 +399,3 @@ $('cSid').textContent = sid;
 health();
 $('msg').focus();
 </script>
-

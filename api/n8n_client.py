@@ -148,6 +148,60 @@ async def flush(timeout: float = 5.0) -> None:
     await asyncio.wait(set(_pending), timeout=timeout)
 
 
+async def cal_slots(day: str, tz_name: str) -> dict[str, Any]:
+    """Return Cal.com's availability state for one day. Never raises.
+
+    Read-only, so it goes straight to Cal.com rather than through n8n --
+    cal-booking-actions only handles the three write actions.
+
+    Why this exists: booking blind meant the only signal was a 400 *after* the
+    attempt, and the model then invented a different day and announced it. With
+    real slots in hand the agent can say "5pm is taken, 4:30 or 5:30 work" and
+    wait for an answer.
+
+    `available` means Cal.com returned a non-empty authoritative schedule.
+    `no_schedule` means the request succeeded but Cal.com returned no slots;
+    this deployment intentionally falls back to local working-day rules.
+    `error` means availability could not be checked and must not be guessed.
+    """
+    if not SETTINGS.cal_api_key or not SETTINGS.cal_username:
+        log.warning("cal slots: CAL_API_KEY / CAL_USERNAME unset")
+        return {"status": "error", "slots": [], "error": "not_configured"}
+
+    params = {
+        "eventTypeSlug": SETTINGS.cal_event_type_slug,
+        "username": SETTINGS.cal_username,
+        "start": day,
+        "end": day,
+        "timeZone": tz_name,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=SETTINGS.n8n_timeout_seconds) as client:
+            res = await client.get(
+                "https://api.cal.com/v2/slots",
+                params=params,
+                headers={
+                    "Authorization": f"Bearer {SETTINGS.cal_api_key}",
+                    # Per-endpoint, NOT global. /v2/slots is 2024-09-04 while
+                    # /v2/bookings is 2024-08-13; sending the booking version
+                    # here returns 404 Cannot GET /v2/slots, which reads like a
+                    # bad URL rather than a bad header.
+                    "cal-api-version": "2024-09-04",
+                },
+            )
+        if res.status_code != 200:
+            log.warning("cal slots %s -> %s %s", day, res.status_code, res.text[:160])
+            return {"status": "error", "slots": [], "error": f"http_{res.status_code}"}
+        slots = (res.json().get("data") or {}).get(day) or []
+        # "2026-08-12T15:30:00.000+05:00" -> "15:30". Cal.com already returns
+        # these in the requested timezone.
+        starts = [s["start"][11:16] for s in slots if isinstance(s, dict) and s.get("start")]
+        return {"status": "available" if starts else "no_schedule", "slots": starts}
+    except Exception as exc:
+        log.warning("cal slots %s unreachable: %s", day, exc)
+        return {"status": "error", "slots": [], "error": type(exc).__name__}
+
+
 async def _demo() -> None:
     import time
 
