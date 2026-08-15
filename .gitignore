@@ -1,10 +1,27 @@
 .env
+.env.*
+!.env.example
 venv/
+.venv/
 __pycache__/
 *.pyc
+*.pyo
 *.md
+!README.md
+!**/README.md
 sitemap.json
 *.pdf
+
+# Test and tooling caches
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editor and operating-system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
 
 # Build artifact -- rebuild with: python kb/chunk.py && python kb/embed.py
 /kb/index/
