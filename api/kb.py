@@ -17,11 +17,13 @@ prefix. Per-visitor and per-turn content goes in user messages, never in here.
 from __future__ import annotations
 
 import json
+import logging
 from functools import lru_cache
 from pathlib import Path
 
 from api.config import get_settings
 
+log = logging.getLogger("kb")
 SETTINGS = get_settings()
 PROMPT_DIR = Path(__file__).resolve().parent / "prompts"
 
@@ -36,6 +38,10 @@ def _read(path: Path, fallback: str = "") -> str:
     try:
         return path.read_text(encoding="utf-8").strip()
     except FileNotFoundError:
+        # Loud, because the failure is otherwise invisible: a missing
+        # guardrails.md does not break anything, it just silently ships a
+        # system prompt with no rules in it.
+        log.warning("prompt file missing: %s -- system prompt is incomplete", path)
         return fallback
 
 

@@ -5,7 +5,9 @@ made sense under prompt caching; Ollama has none, so every turn paid for the
 entire KB in full.
 
 Model and index load once, lazily, behind lru_cache -- warmed in main.py's
-lifespan so the first visitor does not eat the ~2s cold load.
+lifespan so the first visitor does not eat the ~2s cold load. A missing index is
+built on the spot from kb/raw/ (see kb/autobuild.py) rather than left missing:
+kb/index/ is gitignored, so every fresh clone starts without one.
 
 Retrieval failures are non-fatal by design: a missing index degrades the agent
 to "cannot look up specifics" instead of 500ing the turn. The guardrails still
@@ -16,11 +18,12 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import TYPE_CHECKING
 
-from api.config import get_settings
+from api.config import PROJECT_ROOT, get_settings
 
 if TYPE_CHECKING:
     from sentence_transformers import SentenceTransformer
@@ -34,6 +37,10 @@ SETTINGS = get_settings()
 MAX_PER_PATH = 2
 # Fetch this multiple of k before capping, so the cap has something to promote.
 OVERFETCH = 5
+
+# One build attempt per process. A build that fails must not be retried on
+# every visitor question -- it is a minute of CPU that already did not work.
+_BUILD_ATTEMPTED = False
 
 
 @dataclass(frozen=True)
@@ -62,15 +69,50 @@ def _model() -> "SentenceTransformer":
         return SentenceTransformer(SETTINGS.embed_model)
 
 
+def _autobuild() -> None:
+    """Build the index from kb/raw/ if it is missing or stale. Once per process.
+
+    kb/index/ is gitignored, so a fresh clone or a move to another machine has
+    no index at all. The old behaviour was to log one warning and then answer
+    every question ungrounded until an operator noticed and ran two commands;
+    the build is ~a minute of CPU, once.
+
+    Never raises. A failed build leaves _index()'s own error to be the one the
+    caller sees, and retrieval stays unavailable exactly as before.
+    """
+    global _BUILD_ATTEMPTED
+    if _BUILD_ATTEMPTED or not SETTINGS.kb_autobuild:
+        return
+    _BUILD_ATTEMPTED = True
+
+    # kb/ is a sibling of api/, and uvicorn may have been started from
+    # anywhere, so do not assume cwd put the project root on the path.
+    if str(PROJECT_ROOT) not in sys.path:
+        sys.path.insert(0, str(PROJECT_ROOT))
+
+    try:
+        from kb import autobuild
+
+        # Hand over the loaded encoder: chunk verification and embedding both
+        # want it, and a second copy is another ~90MB and another hub check.
+        report = autobuild.ensure(model=_model())
+        if report.stages:
+            log.info("built %s from %s", ", ".join(report.stages), SETTINGS.raw_dir.name)
+    except Exception:
+        log.exception("automatic KB build failed -- retrieval stays unavailable")
+
+
 @lru_cache(maxsize=1)
 def _index() -> tuple[object, list[dict]]:
     """(faiss index, chunk metadata). Row i of the index is chunks[i]."""
     import faiss
 
+    _autobuild()
+
     if not SETTINGS.faiss_file.exists() or not SETTINGS.chunks_file.exists():
         raise FileNotFoundError(
             f"{SETTINGS.faiss_file.name} or {SETTINGS.chunks_file.name} missing -- "
-            "run: python kb/chunk.py && python kb/embed.py"
+            "run: python kb/embed.py"
         )
 
     index = faiss.read_index(str(SETTINGS.faiss_file))
@@ -89,7 +131,12 @@ def _index() -> tuple[object, list[dict]]:
 
 
 def warm() -> bool:
-    """Preload model + index. Returns False if retrieval is unavailable."""
+    """Preload model + index, building the index first if needed.
+
+    Returns False only if retrieval is genuinely unavailable -- kb/raw/ empty,
+    or the build failed. Blocking: main.py runs it off the event loop, and a
+    first-run build takes ~a minute rather than the usual ~2s.
+    """
     try:
         _model()
         _index()

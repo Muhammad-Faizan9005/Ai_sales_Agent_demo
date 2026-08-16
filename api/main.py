@@ -43,6 +43,8 @@ SETTINGS = get_settings()
 async def lifespan(_: FastAPI):
     # Load the embedding model and index up front. Off the event loop because
     # it is ~2s of blocking CPU; the first visitor should not pay for it.
+    # On a machine with no kb/index/ yet this also builds it from kb/raw/, so
+    # startup can take ~a minute once (see kb/autobuild.py).
     ready = await asyncio.to_thread(retrieval.warm)
     status = await llm.probe()
     log.info(
@@ -57,7 +59,12 @@ async def lifespan(_: FastAPI):
     if not status["reachable"]:
         log.warning("Ollama unreachable at %s -- chat will degrade", SETTINGS.ollama_base_url)
     if not ready:
-        log.warning("No FAISS index -- run: python kb/chunk.py && python kb/embed.py")
+        # The build is automatic, so getting here means it could not run: an
+        # empty kb/raw/ (needs python kb/kb_build.py, which fetches the live
+        # site), KB_AUTOBUILD=false, or a build error logged above.
+        log.warning(
+            "No FAISS index and could not build one -- run: python kb/embed.py"
+        )
     async def reap_idle_sessions() -> None:
         idle_seconds = max(1, SETTINGS.session_idle_minutes) * 60
         while True:

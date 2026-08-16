@@ -138,16 +138,21 @@ def write(chunks: list[Chunk]) -> Path:
     return out
 
 
-def verify(chunks: list[Chunk]) -> list[int]:
+def verify(chunks: list[Chunk], model=None) -> list[int]:
     """Assert every chunk fits, using the REAL tokenizer.
 
     A character estimate is what lets this regress quietly: markdown links and
     long URLs tokenize far worse than 4 chars/token, so a chunk that looks fine
     by length can still blow the 256 ceiling.
-    """
-    from sentence_transformers import SentenceTransformer
 
-    model = SentenceTransformer(SETTINGS.embed_model)
+    `model` lets a caller that already has the encoder loaded pass it in --
+    kb/autobuild.py runs inside the API process, where a second copy would mean
+    another ~90MB load and another round of hub revalidation.
+    """
+    if model is None:
+        from sentence_transformers import SentenceTransformer
+
+        model = SentenceTransformer(SETTINGS.embed_model)
     limit = model.max_seq_length
     tokenizer = model.tokenizer
 
