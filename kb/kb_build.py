@@ -3,11 +3,16 @@
     python kb/kb_build.py            # fetch (cached) + emit artifacts
     python kb/kb_build.py --dry-run  # list URLs only, no fetching
     python kb/kb_build.py --refresh  # ignore cache, re-fetch everything
+    python kb/kb_build.py --offline  # rebuild from kb/raw/ only, no network
 
 Two artifacts, two consumers:
   site_kb.md    -> the cached system-prompt payload (requirement 6)
   sitemap.json  -> the navigate_to allowlist, so a page the agent invents is
                    refused before it can send a visitor to a 404 (phase 4)
+
+Both are gitignored derivatives of kb/raw/, which is what --offline exists for:
+a clone has the scraped pages but neither artifact. kb/autobuild.py calls the
+same code path on API startup.
 
 Discovery reads the published sitemaps rather than crawling blind, so the URL
 set is deterministic and every fetch is a page we already know we want.
@@ -270,45 +275,96 @@ def build_sitemap(pages: list[dict], aliases: dict[str, str]) -> dict:
     }
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dry-run", action="store_true", help="list URLs, no scraping")
-    parser.add_argument("--refresh", action="store_true", help="ignore cache")
-    args = parser.parse_args()
+def load_cached_pages() -> list[dict]:
+    """Every page already scraped into kb/raw/. No network, no sitemap.
 
-    print("Reading sitemaps...")
-    urls = clean_urls(fetch_sitemap_urls())
-    print(f"\n{len(urls)} real URLs after filtering")
+    kb/raw/ is the only committed part of the KB, so this is what a fresh clone
+    has to rebuild from -- see kb/autobuild.py. Output order is irrelevant:
+    dedupe(), build_kb() and build_sitemap() all sort by path.
+    """
+    pages: list[dict] = []
+    for file in sorted(SETTINGS.raw_dir.glob("*.json")):
+        try:
+            record = json.loads(file.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            print(f"  ! skipped unreadable {file.name}: {exc}")
+            continue
+        # A record without a path cannot be placed in the KB or the allowlist.
+        if record.get("path") and record.get("markdown"):
+            pages.append(record)
+    return pages
 
-    if args.dry_run:
-        for url in sorted(urls, key=path_of):
-            print(f"  {path_of(url)}")
-        return 0
 
-    SETTINGS.raw_dir.mkdir(parents=True, exist_ok=True)
-    print(f"\nScraping {len(urls)} pages (cached in {SETTINGS.raw_dir.name}/)...")
-    with ThreadPoolExecutor(max_workers=5) as pool:
-        pages = [p for p in pool.map(lambda u: scrape(u, args.refresh), urls) if p]
+def emit_artifacts(pages: list[dict]) -> dict:
+    """pages -> site_kb.md + sitemap.json. Mutates pages (strips boilerplate).
 
+    Shared by the crawl and by the offline rebuild so the two cannot produce
+    different artifacts from the same pages.
+    """
     # Order matters: stripping the nav changes which pages are byte-identical,
     # so boilerplate removal has to precede dedupe.
     junk_lines = strip_boilerplate(pages)
     empty = [p["path"] for p in pages if not p["markdown"]]
     canonical, aliases = dedupe([p for p in pages if p["markdown"]])
     kb_text = build_kb(canonical, aliases)
+
+    SETTINGS.kb_file.parent.mkdir(parents=True, exist_ok=True)
     SETTINGS.kb_file.write_text(kb_text, encoding="utf-8")
     SETTINGS.sitemap_file.write_text(
         json.dumps(build_sitemap(canonical, aliases), indent=2), encoding="utf-8"
     )
+    return {
+        "junk_lines": junk_lines,
+        "empty": empty,
+        "canonical": len(canonical),
+        "aliases": len(aliases),
+        "chars": len(kb_text),
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dry-run", action="store_true", help="list URLs, no scraping")
+    parser.add_argument("--refresh", action="store_true", help="ignore cache")
+    parser.add_argument(
+        "--offline", action="store_true", help="rebuild from kb/raw/ only, no fetching"
+    )
+    args = parser.parse_args()
+
+    if args.offline:
+        pages = load_cached_pages()
+        if not pages:
+            print(f"No cached pages in {SETTINGS.raw_dir} -- run once without --offline.")
+            return 1
+        print(f"Rebuilding from {len(pages)} cached pages in {SETTINGS.raw_dir.name}/")
+        fetched = 0
+    else:
+        print("Reading sitemaps...")
+        urls = clean_urls(fetch_sitemap_urls())
+        print(f"\n{len(urls)} real URLs after filtering")
+
+        if args.dry_run:
+            for url in sorted(urls, key=path_of):
+                print(f"  {path_of(url)}")
+            return 0
+
+        SETTINGS.raw_dir.mkdir(parents=True, exist_ok=True)
+        print(f"\nScraping {len(urls)} pages (cached in {SETTINGS.raw_dir.name}/)...")
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            pages = [p for p in pool.map(lambda u: scrape(u, args.refresh), urls) if p]
+        fetched = len(urls)
+
+    summary = emit_artifacts(pages)
 
     # ~4 chars per token is close enough to gate the phase-1 budget check.
-    tokens = len(kb_text) // 4
-    print(f"\n  scraped     {len(pages)}/{len(urls)}")
-    print(f"  empty       {len(empty)} {empty if empty else ''}")
-    print(f"  boilerplate {junk_lines} repeated lines stripped")
-    print(f"  canonical   {len(canonical)}  (+{len(aliases)} aliases kept navigable)")
-    print(f"  site_kb.md  {len(kb_text):,} chars  ~{tokens:,} tokens")
+    tokens = summary["chars"] // 4
+    print(f"\n  pages       {len(pages)}{f'/{fetched} fetched' if fetched else ' from cache'}")
+    print(f"  empty       {len(summary['empty'])} {summary['empty'] if summary['empty'] else ''}")
+    print(f"  boilerplate {summary['junk_lines']} repeated lines stripped")
+    print(f"  canonical   {summary['canonical']}  (+{summary['aliases']} aliases kept navigable)")
+    print(f"  site_kb.md  {summary['chars']:,} chars  ~{tokens:,} tokens")
     print(f"  budget      {'OK (<60k)' if tokens < 60_000 else 'OVER 60k -- see phase 2'}")
+    print("\nNext: python kb/embed.py  (rebuilds chunks.jsonl + site.faiss)")
     return 0
 
 

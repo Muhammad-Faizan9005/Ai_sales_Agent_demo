@@ -79,6 +79,14 @@ class Settings(BaseSettings):
     retrieval_min_score: float = Field(
         default=0.25, validation_alias=AliasChoices("RETRIEVAL_MIN_SCORE")
     )
+    # Only kb/raw/ is committed -- site_kb.md, sitemap.json and kb/index/ are
+    # gitignored build artifacts, so a fresh clone or a move to another machine
+    # has the scraped pages and nothing derived from them. Build them on
+    # startup instead of serving an ungrounded agent behind a log warning.
+    # Set KB_AUTOBUILD=false to require an explicit `python kb/embed.py`.
+    kb_autobuild: bool = Field(
+        default=True, validation_alias=AliasChoices("KB_AUTOBUILD")
+    )
 
     # ---- Booking (Cal.com) -------------------------------------------------
     cal_api_key: str = Field(default="", validation_alias=AliasChoices("CAL_API_KEY"))

@@ -6,5 +6,13 @@ __pycache__/
 sitemap.json
 *.pdf
 
-# Build artifact -- rebuild with: python kb/chunk.py && python kb/embed.py
+# The prompts are source, not notes: without them api/kb.py builds a system
+# prompt with no guardrails and no persona, silently. The blanket *.md above
+# left them behind on every clone.
+!api/prompts/
+!api/prompts/*.md
+
+# Derived from kb/raw/ -- rebuilt automatically on API startup, or by hand with
+# python kb/embed.py  (see kb/autobuild.py)
 /kb/index/
+/kb/site_kb.md
