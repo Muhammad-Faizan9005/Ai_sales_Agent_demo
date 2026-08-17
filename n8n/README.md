@@ -243,7 +243,18 @@ NOTIFY_FROM_EMAIL=agent@systematicitsolutions.com
 
 WHATSAPP_PHONE_NUMBER_ID=...
 SALES_LEAD_WHATSAPP=+92...
+
+# Where cal-booking-actions posts the booking outcome back to (§4.1).
+# NOT optional: without it the Notify Agent nodes post to an empty URL, the
+# agent never learns whether a booking succeeded, and every meeting comes out
+# as "still confirming" while the calendar fills up.
+AGENT_CALLBACK_URL=http://localhost:8002/api/cal-callback
 ```
+
+> **If n8n runs in Docker, `localhost` is the container, not your machine.** Use
+> `http://host.docker.internal:8002/api/cal-callback` (Docker Desktop) or the
+> host's LAN IP. A wrong value here fails silently in the same shape as the bug
+> this replaced: bookings get created, the agent never hears about them.
 
 Also replace `REPLACE_SHEET_ID` in the `Append to Sheets` node with your spreadsheet ID, and create a `Leads` tab with a header row matching the mapped columns: `captured_at, session_id, name, email, phone, company, service, score, crm_lead_id`.
 
@@ -292,8 +303,8 @@ never `$json.uid`.
 ### `cal-booking-actions` — outbound
 
 `POST /webhook/cal-action`, guarded by the same `X-Webhook-Secret` credential as
-the main events workflow. Unlike that one it responds with the **last node**, so
-the caller gets the booking uid back for a confirmation message.
+the main events workflow. It responds **`onReceived`** — immediately, before any
+work — and reports the real outcome afterwards by calling the app back.
 
 ```json
 { "action": "book",        "session_id": "test-003",
@@ -307,11 +318,47 @@ the caller gets the booking uid back for a confirmation message.
   "booking_uid": "bk_abc123", "start": "2026-08-21T14:00:00Z" }
 ```
 
-Replies `{ ok, action, booking_uid, status, start, meeting_url }`. On failure
-`ok:false` with an `error` string — n8n cannot set a 4xx from a Set node, so
-**callers must check `ok`, not the HTTP status**.
+#### The acknowledgement goes back out, it does not come back on the response
 
-Two behaviours worth knowing:
+This used to respond with the **last node**, so the caller got the booking uid on
+the same HTTP call. That is why it broke. The workflow only answers once
+`Cal Create Booking → Sync Booking State → Write Booking State` has finished, and
+each of those retried three times with 5s waits, so a single retry pushed the
+response past the app's 8s client timeout. `httpx` raised `ReadTimeout`, the app
+read that as a refusal, and told the visitor **"that time is not available"** —
+while Cal.com created the booking and emailed them the invite. One conversation
+produced **four real meetings** the agent believed had all failed, and because no
+uid ever came back, its duplicate guard could not fire either.
+
+So the outcome now travels the other way:
+
+| Node | Fires on | Posts to |
+|---|---|---|
+| `Notify Agent OK` | success, straight off `Sync Booking State` | `POST /api/cal-callback` |
+| `Notify Agent Error` | any error path, after `Respond Error` | same |
+
+```json
+{ "session_id": "…", "action": "book", "ok": true,
+  "booking_uid": "bk_abc123", "status": "accepted",
+  "start": "2026-08-20T09:00:00Z", "meeting_url": "…", "execution_id": "1234" }
+```
+
+Both nodes send `X-Webhook-Secret` from the same Header Auth credential, and the
+app checks it against its own `N8N_WEBHOOK_SECRET`.
+
+Three details that matter if you edit this workflow:
+
+- **`Notify Agent OK` hangs off `Sync Booking State`, deliberately *before*
+  `Write Booking State`** — and is positioned above it so v1 execution order runs
+  it first. The Supabase write allows 15s and retries 3×5s; the visitor is
+  waiting in the chat and must not be queued behind it.
+- **`Cal Create Booking` no longer retries.** `POST /v2/bookings` is not
+  idempotent, so a retry can itself create the second meeting.
+- **`Respond OK` / `Respond Error` are no longer the HTTP response body.** They
+  survive as the shaping nodes and for the execution log. `ok:false` is still the
+  contract on the callback payload.
+
+Two Cal.com behaviours worth knowing:
 
 - **`POST /v2/bookings` is public.** Verified: an unauthenticated call reached
   event-type validation rather than 401. The Bearer key is still sent so hidden

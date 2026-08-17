@@ -114,8 +114,22 @@ class Settings(BaseSettings):
     n8n_webhook_secret: str = Field(
         default="", validation_alias=AliasChoices("N8N_WEBHOOK_SECRET")
     )
+    # Covers only the *fire* POST, which cal-booking-actions answers immediately
+    # (responseMode onReceived). It is NOT how long we wait for a booking: the
+    # outcome arrives separately on /api/cal-callback. Awaiting the workflow's
+    # own response is what produced four real meetings the agent believed had
+    # failed -- see cal_ack_timeout_seconds.
     n8n_timeout_seconds: float = Field(
         default=8.0, validation_alias=AliasChoices("N8N_TIMEOUT_SECONDS")
+    )
+    # How long a booking turn waits for n8n to call back with the real outcome.
+    # Generous on purpose: the visitor sees a "Booking your meeting..." status
+    # for the whole wait, and the alternative -- giving up early -- is what told
+    # visitors their slot was taken while Cal.com was emailing them an invite.
+    # Must exceed the workflow's realistic worst case (Cal.com create plus the
+    # Notify Agent hop), or bookings land as BOOKING_UNCONFIRMED needlessly.
+    cal_ack_timeout_seconds: float = Field(
+        default=45.0, validation_alias=AliasChoices("CAL_ACK_TIMEOUT_SECONDS")
     )
 
     # ---- Supabase (agent_runs) ---------------------------------------------

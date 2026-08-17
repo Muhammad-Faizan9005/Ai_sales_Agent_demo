@@ -195,3 +195,27 @@ class HealthResponse(BaseModel):
     retrieval_ready: bool
     indexed_chunks: int
     embed_model: str
+
+
+class CalCallback(BaseModel):
+    """What cal-booking-actions posts back once Cal.com has answered.
+
+    Shaped by the Notify Agent OK / Notify Agent Error nodes in
+    n8n/cal-booking-actions.json. Everything but session_id is optional: the
+    error branch carries no uid, and a cancel carries no start. `ok` arriving as
+    the string "true" is tolerated because n8n Set nodes stringify values.
+
+    This is the ONLY channel that reports whether a booking happened. The
+    workflow's own HTTP response no longer does -- awaiting it behind an 8s
+    timeout is what told four visitors their real meetings had failed.
+    """
+
+    session_id: str = Field(min_length=1, max_length=64)
+    action: str = Field(default="book", max_length=20)
+    ok: bool = False
+    booking_uid: str | None = Field(default=None, max_length=120)
+    status: str | None = Field(default=None, max_length=40)
+    start: str | None = Field(default=None, max_length=40)
+    meeting_url: str | None = Field(default=None, max_length=500)
+    error: str | None = Field(default=None, max_length=500)
+    execution_id: str | None = Field(default=None, max_length=40)

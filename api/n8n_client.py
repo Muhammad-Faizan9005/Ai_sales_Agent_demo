@@ -5,13 +5,17 @@ write, a Slack ping and a rep email take seconds, and none of them belong in a
 visitor's reply latency. So `emit_event` returns immediately and the HTTP call
 runs on a background task.
 
-Two directions:
+Two directions out, one back in:
 
-  emit_event()     -> sales-agent-events   fire-and-forget, never awaited
-  call_cal_action() -> cal-action           awaited, because booking needs a
-                                            confirmed slot before we can answer
+  emit_event()      -> sales-agent-events   fire-and-forget, never awaited
+  fire_cal_action() -> cal-action           awaited only until n8n ACCEPTS it;
+                                            the booking outcome is not on this
+                                            call
+  /api/cal-callback <- cal-action           n8n posts the real outcome back, and
+                                            resolve_ack() wakes the waiting turn
 
-Both webhooks use the same n8n Header Auth credential, sent as X-Webhook-Secret.
+Both outbound webhooks use the same n8n Header Auth credential, sent as
+X-Webhook-Secret; the inbound callback is checked against the same value.
 """
 
 from __future__ import annotations
@@ -120,25 +124,99 @@ def emit_event(event_type: str, session_id: str, payload: dict[str, Any]) -> Non
     task.add_done_callback(_done)
 
 
-async def call_cal_action(action: str, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
-    """Book / cancel / reschedule via the cal-action workflow. Awaited.
+async def fire_cal_action(action: str, session_id: str, payload: dict[str, Any]) -> bool:
+    """POST a booking action at n8n. Returns whether n8n ACCEPTED the request.
 
-    Returns {"ok": bool, ...}. Never raises: a booking failure must degrade to
-    "I'll have someone confirm by email", not a broken chat turn.
+    Deliberately NOT the outcome. cal-booking-actions responds onReceived, so
+    this returns in milliseconds and the real result -- uid, status, error --
+    arrives separately on /api/cal-callback and is applied by
+    tools.apply_booking_ack.
+
+    This used to await the entire workflow with an 8s timeout. The workflow
+    responds only after Cal Create Booking, Sync Booking State and Write
+    Booking State finish, and each of those retries three times with 5s waits,
+    so any retry outran the timeout. httpx raised ReadTimeout, _post swallowed
+    it, and the tool reported "that time is not available" to four separate
+    visitors while Cal.com was emailing them invites for meetings that did
+    exist. Never put the booking outcome back on this call.
     """
     body = {"action": action, "session_id": session_id, **payload}
+    record: dict[str, Any] = {
+        "event_type": f"cal_action:{action}",
+        "session_id": session_id,
+        "at": datetime.now(timezone.utc).isoformat(),
+        "payload": body,
+        "status": "pending",
+    }
+    _sent.append(record)
+
     res = await _post(SETTINGS.n8n_cal_action_url, body, SETTINGS.n8n_timeout_seconds)
     if res is None:
-        return {"ok": False, "error": "unreachable"}
-    if res.status_code >= 400:
-        return {"ok": False, "error": f"http_{res.status_code}"}
-    try:
-        data = res.json()
-    except ValueError:
-        return {"ok": False, "error": "bad_json"}
-    if isinstance(data, list):
-        data = data[0] if data else {}
-    return {"ok": True, **(data if isinstance(data, dict) else {"data": data})}
+        record["status"] = "unreachable"
+        return False
+    record["status"] = f"http_{res.status_code}"
+    return res.status_code < 400
+
+
+def record_ack(session_id: str, payload: dict[str, Any]) -> None:
+    """Log an inbound /api/cal-callback so the test console can see the handshake."""
+    _sent.append(
+        {
+            "event_type": f"cal_ack:{payload.get('action') or 'unknown'}",
+            "session_id": session_id,
+            "at": datetime.now(timezone.utc).isoformat(),
+            "payload": payload,
+            "status": "ok" if payload.get("ok") else "failed",
+        }
+    )
+
+
+# --------------------------------------------------------------------------
+# Booking acknowledgements
+# --------------------------------------------------------------------------
+#
+# session_id -> Event. A booking turn registers before it fires and then parks
+# on the event; the /api/cal-callback route sets it when n8n reports back.
+#
+# Keyed by session alone, with no correlation id, because tools.py permits only
+# one booking action in flight per session -- see the booking_intent guard. That
+# guard is also what stops a second Cal.com booking being created while the
+# first is still unconfirmed.
+_acks: dict[str, asyncio.Event] = {}
+
+
+def register_ack(session_id: str) -> asyncio.Event:
+    """Claim the ack slot for this session. Call BEFORE firing, never after.
+
+    Registering after the POST loses the race against a fast workflow: the
+    callback would find no waiter and the turn would sit out its whole timeout
+    for an ack that had already arrived.
+    """
+    event = asyncio.Event()
+    _acks[session_id] = event
+    return event
+
+
+def resolve_ack(session_id: str) -> bool:
+    """Wake the turn waiting on this session. False when nobody is waiting.
+
+    False is normal, not an error: it means the turn already timed out and gave
+    the visitor a BOOKING_UNCONFIRMED answer. The state has still been applied
+    by then, so the next prompt carries the truth.
+    """
+    event = _acks.get(session_id)
+    if event is None:
+        return False
+    event.set()
+    return True
+
+
+def discard_ack(session_id: str) -> None:
+    _acks.pop(session_id, None)
+
+
+def waiting_for_ack(session_id: str) -> bool:
+    return session_id in _acks
 
 
 async def flush(timeout: float = 5.0) -> None:
@@ -226,9 +304,19 @@ async def _demo() -> None:
         raise AssertionError("bad event_type was accepted")
 
     SETTINGS.n8n_cal_action_url = "http://127.0.0.1:9/never-listens"
-    result = await call_cal_action("book", "s-1", {"start": "2026-08-12T09:00:00Z"})
-    assert result == {"ok": False, "error": "unreachable"}, result
-    print("OK  cal action returns ok=False instead of raising")
+    accepted = await fire_cal_action("book", "s-1", {"start": "2026-08-12T09:00:00Z"})
+    assert accepted is False, accepted
+    print("OK  cal action reports not-accepted instead of raising")
+
+    # The handshake: a turn parks on the event, the callback wakes it. Without
+    # this the booking turn would sit out its full 45s timeout every time.
+    event = register_ack("s-2")
+    assert waiting_for_ack("s-2")
+    assert resolve_ack("s-2") is True
+    await asyncio.wait_for(event.wait(), timeout=1)
+    discard_ack("s-2")
+    assert resolve_ack("s-2") is False, "a discarded ack slot still had a waiter"
+    print("OK  ack registry wakes a waiting turn, and tolerates a late callback")
 
 
 if __name__ == "__main__":

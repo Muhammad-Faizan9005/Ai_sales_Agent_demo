@@ -6,27 +6,29 @@ Port 8002 is the project default and lives in config (API_PORT), so the
 widget, CORS and the run command cannot drift apart.
 
 Endpoints:
-    POST /api/chat   SSE stream of one turn
-    POST /api/end    conversation finished (widget unload)
-    GET  /api/health readiness + config visibility
+    POST /api/chat         SSE stream of one turn
+    POST /api/end          conversation finished (widget unload)
+    POST /api/cal-callback n8n reports a booking outcome (X-Webhook-Secret)
+    GET  /api/health       readiness + config visibility
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 
 from api import chat as chat_module
-from api import llm, n8n_client, retrieval
+from api import llm, n8n_client, retrieval, tools
 from api.config import get_settings
 from api.dashboard import router as dashboard_router
 from api.kb import allowed_paths, system_prompt
-from api.schemas import ChatRequest, HealthResponse
+from api.schemas import CalCallback, ChatRequest, HealthResponse
 from api.store import SESSIONS
 
 logging.basicConfig(
@@ -126,6 +128,47 @@ async def post_end(payload: dict) -> dict:
     if session_id:
         await chat_module.end_conversation(session_id)
     return {"ok": True}
+
+
+@app.post("/api/cal-callback")
+async def post_cal_callback(
+    payload: CalCallback,
+    x_webhook_secret: str | None = Header(default=None),
+) -> dict:
+    """n8n reports what Cal.com actually did. The only source of booking truth.
+
+    The booking turn is parked on an asyncio.Event waiting for this. Applying
+    the outcome here rather than in the tool keeps a single writer, so a late or
+    retried callback cannot race the turn that fired it.
+
+    Deliberately does NOT take session.turn_lock: the waiting turn holds it, and
+    acquiring it here would deadlock the exact request that releases it. Safe
+    without: this and the turn share one event loop, and the turn is parked at an
+    await while this runs.
+    """
+    expected = SETTINGS.n8n_webhook_secret
+    if not expected:
+        # Refuse rather than default open -- this route mutates booking state.
+        log.warning("cal callback refused: N8N_WEBHOOK_SECRET is unset")
+        raise HTTPException(503, "callback not configured")
+    if not secrets.compare_digest(x_webhook_secret or "", expected):
+        raise HTTPException(401, "bad webhook secret")
+
+    data = payload.model_dump()
+    session = SESSIONS.get(payload.session_id)
+    n8n_client.record_ack(payload.session_id, data)
+    applied = tools.apply_booking_ack(session, data)
+    waiting = n8n_client.resolve_ack(payload.session_id)
+    log.info(
+        "cal ack %s %s ok=%s uid=%s applied=%s waiting=%s",
+        payload.session_id,
+        payload.action,
+        payload.ok,
+        payload.booking_uid,
+        applied,
+        waiting,
+    )
+    return {"ok": True, "applied": applied, "waiting": waiting}
 
 
 @app.get("/console")

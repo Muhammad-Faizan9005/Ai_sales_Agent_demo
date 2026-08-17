@@ -102,6 +102,7 @@ Every `{{ $env.X }}` referenced across the five workflows:
 | `CAL_API_KEY` | cal-actions | `cal_live_…`, sent as `Bearer` |
 | `CAL_USERNAME` | cal-actions | Fallback when no `event_type_id` is passed |
 | `CAL_EVENT_TYPE_SLUG` | cal-actions | Fallback, e.g. `30min` |
+| `AGENT_CALLBACK_URL` | cal-actions | `http://localhost:8002/api/cal-callback`. Where `Notify Agent OK` / `Notify Agent Error` report the booking outcome — the webhook responds `onReceived`, so this is the **only** channel that tells the agent whether a meeting exists. **In Docker, `localhost` is the container:** use `http://host.docker.internal:8002/api/cal-callback` |
 | `ANTHROPIC_API_KEY` | faq-clustering | `x-api-key` header |
 
 > **Self-hosted n8n:** set `N8N_BLOCK_ENV_ACCESS_IN_NODE=false` or every `$env`

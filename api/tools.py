@@ -11,6 +11,7 @@ instead.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from datetime import date, datetime, timedelta, timezone
@@ -345,10 +346,246 @@ def _offer(free: list[str], around: str, limit: int = 3) -> str:
     )
 
 
+# --------------------------------------------------------------------------
+# The booking handshake
+# --------------------------------------------------------------------------
+#
+# Booking is asynchronous. We fire the cal-action webhook, n8n books with
+# Cal.com, and n8n POSTs the outcome back to /api/cal-callback, which applies it
+# and wakes the waiting turn. The turn does wait -- the visitor is sitting there
+# expecting a yes or no -- but it waits on the *callback*, not on the workflow's
+# own HTTP response.
+#
+# The distinction is the whole point. Awaiting the workflow response meant an 8s
+# httpx timeout decided whether a booking had happened, and every run slower
+# than that was reported to the visitor as "that time is not available" while
+# Cal.com emailed them a real invite. Four meetings were created that way in one
+# conversation, none of which the agent knew about.
+
+# How long a pending intent keeps the door shut. Long enough that a slow-but-
+# working n8n cannot produce a duplicate; short enough that a visitor whose ack
+# was lost outright is not locked out of booking for the rest of the session.
+BOOKING_LOCK_MINUTES = 10
+
+
+def _iso_z(value: str | None) -> str | None:
+    """Normalise an ISO timestamp to the trailing-Z form n8n and Cal.com use."""
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return value
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _human_from_iso(value: str | None) -> str | None:
+    iso = _iso_z(value)
+    if not iso:
+        return None
+    try:
+        parsed = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return _human_time(parsed.astimezone(ZoneInfo(SETTINGS.meeting_timezone)))
+
+
+def _pending_intent(session: Session) -> dict[str, Any] | None:
+    """The booking still awaiting an acknowledgement, if there is one.
+
+    A `pending` intent is a lock: while one exists no second Cal.com booking may
+    be fired for this session. It expires after BOOKING_LOCK_MINUTES so a
+    genuinely lost acknowledgement does not strand the visitor.
+    """
+    intent = session.booking_intent
+    if not intent or intent.get("state") != "pending":
+        return None
+    fired_at = intent.get("fired_at")
+    try:
+        fired = datetime.fromisoformat(str(fired_at))
+    except (TypeError, ValueError):
+        return intent
+    if fired.tzinfo is None:
+        fired = fired.replace(tzinfo=timezone.utc)
+    if datetime.now(timezone.utc) - fired > timedelta(minutes=BOOKING_LOCK_MINUTES):
+        intent["state"] = "stale"
+        return None
+    return intent
+
+
+async def _fire_and_wait(session: Session, action: str, payload: dict[str, Any]) -> str:
+    """Fire a cal action, then wait for n8n's callback.
+
+    Returns "acked" | "rejected" | "timeout". It deliberately reports nothing
+    about the booking itself: the callback route has already applied the outcome
+    to the session by the time this returns "acked", and the caller reads it from
+    there. One writer, so a retried or late callback cannot race the turn.
+    """
+    event = n8n_client.register_ack(session.session_id)
+    try:
+        accepted = await n8n_client.fire_cal_action(action, session.session_id, payload)
+        if not accepted:
+            return "rejected"
+        await asyncio.wait_for(event.wait(), timeout=SETTINGS.cal_ack_timeout_seconds)
+        return "acked"
+    except asyncio.TimeoutError:
+        log.warning(
+            "no cal ack for %s after %.0fs (%s)",
+            session.session_id,
+            SETTINGS.cal_ack_timeout_seconds,
+            action,
+        )
+        return "timeout"
+    finally:
+        # Always release the slot. A callback arriving after this point finds no
+        # waiter, which is fine -- apply_booking_ack still runs, so the next
+        # turn's prompt carries the real state.
+        n8n_client.discard_ack(session.session_id)
+
+
+def apply_booking_ack(session: Session, payload: dict[str, Any]) -> bool:
+    """Apply n8n's booking outcome. The ONLY writer of booking state.
+
+    Called from /api/cal-callback and from nowhere else; the tool that fired the
+    action only reads what this wrote. Returns whether anything changed.
+
+    Idempotent, because n8n retries a failed Notify Agent node up to three times.
+    Re-applying a uid we already hold must not emit a second meeting_booked
+    event -- the proposal branch has no idempotency guard and would create a
+    duplicate AutoCRM prep task.
+    """
+    action = str(payload.get("action") or "book").lower()
+    ok = bool(payload.get("ok"))
+    uid = _clean(payload.get("booking_uid")) or _clean(payload.get("uid"))
+    intent = session.booking_intent or {}
+
+    # ok-with-no-uid is not a booking. That rule predates the callback and still
+    # holds: a response can be well-formed and carry no booking at all.
+    if not ok or (action != "cancel" and not uid):
+        session.booking_error = (
+            _clean(payload.get("error")) or "no booking_uid returned"
+        )
+        if intent:
+            intent["state"] = "failed"
+        log.warning("booking ack failed for %s: %s", session.session_id, payload)
+        persist(session, _lead_status(session))
+        return True
+
+    if action == "cancel":
+        if not session.meeting_booked and session.cal_booking_uid is None:
+            return False  # already applied
+        session.meeting_booked = False
+        session.cal_booking_uid = None
+        session.booking_error = None
+        if intent:
+            intent["state"] = "confirmed"
+        persist(session, _lead_status(session))
+        return True
+
+    if session.cal_booking_uid == uid and session.meeting_booked:
+        return False  # duplicate ack for a booking we already hold
+
+    start_iso = _iso_z(_clean(payload.get("start"))) or intent.get("start_iso")
+    human = _human_from_iso(start_iso) or intent.get("human") or "your meeting"
+
+    session.meeting_booked = True
+    session.cal_booking_uid = uid
+    session.pending_meeting_start = None
+    session.pending_meeting_label = None
+    session.booking_error = None
+    if intent:
+        intent.update(state="confirmed", uid=uid, start_iso=start_iso, human=human)
+    else:
+        # A booking we never fired -- a stray or replayed callback. Record it
+        # anyway: an unknown real meeting is exactly what we lost before.
+        session.booking_intent = {
+            "action": action,
+            "start_iso": start_iso,
+            "human": human,
+            "fired_at": datetime.now(timezone.utc).isoformat(),
+            "state": "confirmed",
+            "uid": uid,
+        }
+
+    status = _lead_status(session)
+    persist(session, status)
+    n8n_client.emit_event(
+        "meeting_booked",
+        session.session_id,
+        {
+            **_lead_payload(session, status),
+            # NESTED under "meeting" because that is what the workflow reads.
+            # sales-agent-events -> Meeting Details does `b.meeting?.start_time`
+            # and THROWS when it is absent, routing the whole branch to Record
+            # Failure: no lead status update, no prep task, no rep email, no
+            # visitor confirmation. A flat meeting_time key silently killed
+            # every booking. See n8n/docs_n8n/contracts.md s2.3.
+            "meeting": {
+                "start_time": start_iso,
+                "uid": uid,
+                "meeting_url": _clean(payload.get("meeting_url")),
+                "status": _clean(payload.get("status")) or "accepted",
+            },
+            # Kept flat alongside for the humans reading n8n's execution log --
+            # the workflow derives its own localised string from start_time.
+            "meeting_time_local": human,
+            **(
+                {"rescheduled_from_uid": intent.get("from_uid")}
+                if intent.get("from_uid")
+                else {}
+            ),
+        },
+    )
+    return True
+
+
+def booking_state_note(session: Session) -> str:
+    """The booking line injected into every prompt, or "" when there is nothing.
+
+    This is what closes the loop on an asynchronous booking. The ack may land
+    after the turn that fired it has already answered, so the model has to be
+    told the current state on every subsequent call rather than inferring it
+    from a tool result it saw once.
+    """
+    intent = session.booking_intent or {}
+    human = intent.get("human") or session.pending_meeting_label
+
+    if session.meeting_booked and session.cal_booking_uid:
+        when = human or "an agreed time"
+        return (
+            f"[Booking status: CONFIRMED for {when}. This meeting is real and on "
+            "the calendar. Do not book again and do not offer to book -- to move "
+            "it use reschedule_meeting, to cancel it use cancel_meeting.]"
+        )
+
+    if _pending_intent(session):
+        when = human or "the time they asked for"
+        return (
+            f"[Booking status: AWAITING CONFIRMATION for {when}. Do not say it is "
+            "booked and do not say the time is unavailable -- neither is known "
+            "yet. Do not start another booking. If they ask, say you are still "
+            "confirming it and the invite will arrive by email.]"
+        )
+
+    if intent.get("state") in ("failed", "stale"):
+        when = human or "the time they asked for"
+        reason = session.booking_error or "it could not be confirmed"
+        return (
+            f"[Booking status: NOT BOOKED. The attempt for {when} did not go "
+            f"through ({reason}). Nothing is on the calendar. Do not claim "
+            "otherwise. You may ask for another time within the next 3 working "
+            "days, 9am-5pm.]"
+        )
+
+    return ""
+
+
 async def book_meeting(session: Session, **kwargs: Any) -> str:
     """Book the call at the time the visitor asked for.
 
-    Three guards, each from a defect that reached a real visitor:
+    Four guards, each from a defect that reached a real visitor:
 
       * Contact details first. This used to require only an email, so the agent
         booked before qualification finished and AutoCRM got a lead with no
@@ -358,6 +595,10 @@ async def book_meeting(session: Session, **kwargs: Any) -> str:
         and announced it as booked.
       * The visitor must have named the time. The agent may never move someone
         to a slot they did not say aloud.
+      * One booking in flight at a time. The outcome now arrives asynchronously,
+        so without this a visitor naming a second date before the first ack
+        lands fires a second Cal.com booking. One conversation produced four
+        real meetings that way.
     """
     tz_name = SETTINGS.meeting_timezone
     if session.cal_booking_uid:
@@ -365,6 +606,14 @@ async def book_meeting(session: Session, **kwargs: Any) -> str:
             "ALREADY_BOOKED: this visitor already has a meeting. Do not create "
             "another one. If they requested a different time, use "
             "reschedule_meeting; otherwise confirm the existing booking."
+        )
+    in_flight = _pending_intent(session)
+    if in_flight:
+        return (
+            f"BOOKING_IN_FLIGHT: a booking for {in_flight.get('human') or 'this visitor'} "
+            "was already sent and is still being confirmed. Do NOT start another "
+            "one. Tell them it is still being confirmed and the calendar invite "
+            "will arrive by email, then stop. Do not offer a different time."
         )
     missing = _missing_qualification_fields(session)
     if missing:
@@ -470,12 +719,24 @@ async def book_meeting(session: Session, **kwargs: Any) -> str:
     # `no_schedule` is intentional in this deployment: weekday/business-hour
     # rules permit an exact booking attempt, whose UID remains the authority.
 
-    result = await n8n_client.call_cal_action(
+    start_iso = start.isoformat().replace("+00:00", "Z")
+    session.booking_intent = {
+        "action": "book",
+        "start_iso": start_iso,
+        "human": human,
+        "fired_at": datetime.now(timezone.utc).isoformat(),
+        "state": "pending",
+    }
+    session.booking_error = None
+    session.note_action("book_meeting")
+    persist(session, _lead_status(session))
+
+    outcome = await _fire_and_wait(
+        session,
         "book",
-        session.session_id,
         {
             # Keys below must match cal-booking-actions -> Validate Request.
-            "start": start.isoformat().replace("+00:00", "Z"),
+            "start": start_iso,
             "attendee": {
                 "name": name or "Website visitor",
                 "email": email,
@@ -485,18 +746,12 @@ async def book_meeting(session: Session, **kwargs: Any) -> str:
         },
     )
 
-    # THE UID IS THE ONLY PROOF A MEETING EXISTS.
-    #
-    # Extracted before any state is mutated, because `ok:true` is not enough: a
-    # response can be well-formed and still carry no booking. Previously
-    # meeting_booked was set first and the uid read afterwards, so an ok-but-
-    # uidless response marked the run booked and emitted meeting_booked to n8n
-    # for a meeting nobody had.
-    booking_uid = result.get("booking_uid") or result.get("uid")
-
-    if not result.get("ok") or not booking_uid:
+    if outcome == "rejected":
+        # n8n never accepted the request, so nothing was created. This is the one
+        # case where "not available" is honest.
+        session.booking_intent["state"] = "failed"
+        session.booking_error = "the booking request was not accepted"
         # A failed booking must not lose the lead: persist and let a human recover.
-        log.warning("booking failed for %s: %s", session.session_id, result)
         save_lead(session, visitor_name=name, visitor_email=email, visitor_phone=phone)
         session.fields["requested_meeting_time"] = human
         persist(session, _lead_status(session))
@@ -514,38 +769,43 @@ async def book_meeting(session: Session, **kwargs: Any) -> str:
             "mention systems, errors or calendars."
         )
 
-    session.meeting_booked = True
-    session.cal_booking_uid = booking_uid
-    session.pending_meeting_start = None
-    session.pending_meeting_label = None
-    session.note_action("book_meeting")
-    status = _lead_status(session)
-    persist(session, status)
-    n8n_client.emit_event(
-        "meeting_booked",
-        session.session_id,
-        {
-            **_lead_payload(session, status),
-            # NESTED under "meeting" because that is what the workflow reads.
-            # sales-agent-events -> Meeting Details does `b.meeting?.start_time`
-            # and THROWS when it is absent, routing the whole branch to Record
-            # Failure: no lead status update, no prep task, no rep email, no
-            # visitor confirmation. A flat meeting_time key silently killed
-            # every booking. See n8n/docs_n8n/contracts.md s2.3.
-            "meeting": {
-                "start_time": start.isoformat().replace("+00:00", "Z"),
-                "uid": session.cal_booking_uid,
-                "meeting_url": result.get("meeting_url"),
-                "status": result.get("status", "accepted"),
-            },
-            # Kept flat alongside for the humans reading n8n's execution log --
-            # the workflow derives its own localised string from start_time.
-            "meeting_time_local": human,
-        },
-    )
+    if outcome == "timeout":
+        # The intent stays pending on purpose: the booking may well exist, and a
+        # late callback will still confirm it. Saying "not available" here is the
+        # exact lie that told four visitors their meetings had failed.
+        session.fields["requested_meeting_time"] = human
+        persist(session, _lead_status(session))
+        return (
+            f"BOOKING_UNCONFIRMED: {human} was sent for booking but has not come "
+            "back confirmed yet. Do NOT say it is booked and do NOT say the time "
+            "is unavailable -- neither is known. Tell them you are still "
+            "confirming it and the calendar invite will follow by email shortly, "
+            "then stop. Do not attempt another booking and do not offer a "
+            "different time. Do not mention systems, errors or calendars."
+        )
+
+    # Acked. The callback has already applied the outcome, so the session -- not
+    # this coroutine -- is the authority on what happened.
+    if session.meeting_booked and session.cal_booking_uid:
+        # The acknowledged time, not the requested one. If Cal.com booked
+        # something other than what we asked for, the visitor must be told what
+        # is actually on the calendar -- and it must match the booking status
+        # line the model sees on the next turn.
+        confirmed = (session.booking_intent or {}).get("human") or human
+        return (
+            f"BOOKED for {confirmed} ({tz_name}). Confirm that warmly, tell them the "
+            f"calendar invite is on its way to {email}, and stop selling."
+        )
+
+    save_lead(session, visitor_name=name, visitor_email=email, visitor_phone=phone)
+    session.fields["requested_meeting_time"] = human
+    persist(session, _lead_status(session))
     return (
-        f"BOOKED for {human} ({tz_name}). Confirm that warmly, tell them the "
-        f"calendar invite is on its way to {email}, and stop selling."
+        f"NOT_BOOKED: {human} could not be taken. Do NOT say it is booked, "
+        "confirmed, arranged, or that anyone will confirm it later -- none of "
+        "that is true. Tell them plainly that time is not available, then ask "
+        "for another time within the next 3 working days, 9am-5pm. Do not "
+        "mention systems, errors or calendars."
     )
 
 
@@ -569,6 +829,14 @@ async def reschedule_meeting(session: Session, **kwargs: Any) -> str:
             "ASK: there is no booking on record for this visitor, so nothing to "
             "move. If they want a call, collect their details and book one."
         )
+    in_flight = _pending_intent(session)
+    if in_flight:
+        return (
+            f"BOOKING_IN_FLIGHT: a change for {in_flight.get('human') or 'this visitor'} "
+            "was already sent and is still being confirmed. Do NOT send another. "
+            "Tell them it is still being confirmed and they will get an updated "
+            "invite by email, then stop."
+        )
     if not wanted:
         return "ASK: no new time given. Ask what day and time they would prefer instead."
 
@@ -580,10 +848,21 @@ async def reschedule_meeting(session: Session, **kwargs: Any) -> str:
         )
 
     local = start.astimezone(ZoneInfo(tz_name))
-    human = local.strftime("%A %d %B at %I:%M %p").replace(" 0", " ")
+    human = _human_time(local)
 
-    is_free, free = await _slot_check(start, tz_name)
-    if not is_free:
+    # `availability` is a STATUS STRING, not a bool. This was `is_free, free =
+    # ...` followed by `if not is_free:`, which never fired -- every non-empty
+    # string is truthy -- so the guard was dead code and a reschedule would move
+    # a meeting onto an occupied slot. book_meeting was migrated to the string
+    # form; this call site was missed.
+    availability, free = await _slot_check(start, tz_name)
+    if availability == "error":
+        return (
+            f"AVAILABILITY_UNKNOWN: could not verify {human}. Their existing "
+            "meeting is UNCHANGED and nothing has been moved. Tell them "
+            "availability could not be confirmed and ask to try again."
+        )
+    if availability == "unavailable":
         alternatives = _offer(free, local.strftime("%H:%M"))
         return (
             f"SLOT_TAKEN: {human} is not available. Their existing meeting is "
@@ -593,48 +872,53 @@ async def reschedule_meeting(session: Session, **kwargs: Any) -> str:
         )
 
     old_uid = session.cal_booking_uid
-    result = await n8n_client.call_cal_action(
+    start_iso = start.isoformat().replace("+00:00", "Z")
+    session.booking_intent = {
+        "action": "reschedule",
+        "start_iso": start_iso,
+        "human": human,
+        "fired_at": datetime.now(timezone.utc).isoformat(),
+        "state": "pending",
+        "from_uid": old_uid,
+    }
+    session.booking_error = None
+    session.note_action("reschedule_meeting")
+
+    outcome = await _fire_and_wait(
+        session,
         "reschedule",
-        session.session_id,
         {
             "booking_uid": old_uid,
-            "start": start.isoformat().replace("+00:00", "Z"),
+            "start": start_iso,
             "reason": _clean(kwargs.get("reason")) or "Rescheduled at the visitor's request",
         },
     )
 
-    new_uid = result.get("booking_uid") or result.get("uid")
-    if not result.get("ok") or not new_uid:
-        log.warning("reschedule failed for %s: %s", session.session_id, result)
+    if outcome == "timeout":
         return (
-            f"NOT_RESCHEDULED: could not move the meeting to {human}. Do NOT say "
-            "it has been moved. Their ORIGINAL meeting still stands -- say that "
-            "plainly, and offer to try another time. Do not mention systems."
+            f"RESCHEDULE_UNCONFIRMED: the move to {human} was sent but has not "
+            "come back confirmed. Do NOT say it has been moved and do NOT say it "
+            "failed -- neither is known. Tell them you are still confirming the "
+            "change and an updated invite will follow by email, then stop. Do not "
+            "send another change."
         )
 
-    session.cal_booking_uid = new_uid
-    session.meeting_booked = True
-    session.note_action("reschedule_meeting")
-    status = _lead_status(session)
-    persist(session, status)
-    n8n_client.emit_event(
-        "meeting_booked",
-        session.session_id,
-        {
-            **_lead_payload(session, status),
-            "meeting": {
-                "start_time": start.isoformat().replace("+00:00", "Z"),
-                "uid": new_uid,
-                "meeting_url": result.get("meeting_url"),
-                "status": result.get("status", "accepted"),
-            },
-            "meeting_time_local": human,
-            "rescheduled_from_uid": old_uid,
-        },
-    )
+    # Cal.com's reschedule mints a NEW uid and cancels the old one; the callback
+    # has already written it back, or the next cancel would target a uid Cal.com
+    # has retired.
+    if outcome == "acked" and session.cal_booking_uid and session.cal_booking_uid != old_uid:
+        confirmed = (session.booking_intent or {}).get("human") or human
+        return (
+            f"RESCHEDULED to {confirmed} ({tz_name}). The original slot is released -- "
+            "there is only one meeting. Confirm the new time warmly and stop selling."
+        )
+
+    session.booking_intent["state"] = "failed"
+    log.warning("reschedule failed for %s: %s", session.session_id, outcome)
     return (
-        f"RESCHEDULED to {human} ({tz_name}). The original slot is released -- "
-        "there is only one meeting. Confirm the new time warmly and stop selling."
+        f"NOT_RESCHEDULED: could not move the meeting to {human}. Do NOT say "
+        "it has been moved. Their ORIGINAL meeting still stands -- say that "
+        "plainly, and offer to try another time. Do not mention systems."
     )
 
 
@@ -643,30 +927,46 @@ async def cancel_meeting(session: Session, **kwargs: Any) -> str:
     if not session.cal_booking_uid:
         return "ASK: there is no booking on record for this visitor, so nothing to cancel."
 
-    result = await n8n_client.call_cal_action(
+    session.booking_intent = {
+        "action": "cancel",
+        "start_iso": (session.booking_intent or {}).get("start_iso"),
+        "human": (session.booking_intent or {}).get("human"),
+        "fired_at": datetime.now(timezone.utc).isoformat(),
+        "state": "pending",
+    }
+    session.note_action("cancel_meeting")
+
+    outcome = await _fire_and_wait(
+        session,
         "cancel",
-        session.session_id,
         {
             "booking_uid": session.cal_booking_uid,
             "reason": _clean(kwargs.get("reason")) or "Cancelled at the visitor's request",
         },
     )
 
-    if not result.get("ok"):
-        log.warning("cancel failed for %s: %s", session.session_id, result)
+    if outcome == "timeout":
         return (
-            "NOT_CANCELLED: the meeting could not be cancelled. Do NOT say it is "
-            "cancelled -- it still stands. Offer to have someone sort it out, and "
-            "do not mention systems."
+            "CANCEL_UNCONFIRMED: the cancellation was sent but has not come back "
+            "confirmed. Do NOT say it is cancelled -- that is not known yet. Tell "
+            "them you are processing it and they will get a confirmation by email, "
+            "then stop."
         )
 
-    session.meeting_booked = False
-    session.cal_booking_uid = None
-    session.note_action("cancel_meeting")
-    persist(session, _lead_status(session))
+    # The callback clears the uid on a successful cancel, so an empty uid here is
+    # the proof -- not the fact that the request was accepted.
+    if outcome == "acked" and not session.cal_booking_uid:
+        return (
+            "CANCELLED. Confirm it is cancelled, and ask -- once, without pushing -- "
+            "whether they would like a different time instead."
+        )
+
+    session.booking_intent["state"] = "failed"
+    log.warning("cancel failed for %s: %s", session.session_id, outcome)
     return (
-        "CANCELLED. Confirm it is cancelled, and ask -- once, without pushing -- "
-        "whether they would like a different time instead."
+        "NOT_CANCELLED: the meeting could not be cancelled. Do NOT say it is "
+        "cancelled -- it still stands. Offer to have someone sort it out, and "
+        "do not mention systems."
     )
 
 

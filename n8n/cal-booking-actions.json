@@ -6,7 +6,7 @@
         "httpMethod": "POST",
         "path": "cal-action",
         "authentication": "headerAuth",
-        "responseMode": "lastNode",
+        "responseMode": "onReceived",
         "options": {}
       },
       "id": "d1000000-0000-4000-8000-000000000001",
@@ -24,7 +24,7 @@
           "name": "Sales Agent Webhook Secret"
         }
       },
-      "notes": "responseMode lastNode, NOT onReceived: the caller needs the booking uid back to show a confirmation. Reuses the same X-Webhook-Secret credential as sales-agent-events.\n\nPOST { action: book|cancel|reschedule, session_id, start?, booking_uid?, attendee:{name,email,timeZone}, reason? }"
+      "notes": "responseMode onReceived: the caller does NOT wait on this response. It used to be lastNode, so an 8s client timeout decided whether a booking had happened -- four real meetings were created while the visitor was told the slot was unavailable. The outcome now goes back out through Notify Agent OK / Notify Agent Error to POST /api/cal-callback.\n\nPOST { action: book|cancel|reschedule, session_id, start?, booking_uid?, attendee:{name,email,timeZone}, reason? }"
     },
     {
       "parameters": {
@@ -163,10 +163,7 @@
         140
       ],
       "onError": "continueErrorOutput",
-      "notes": "POST /v2/bookings is PUBLIC (verified 2026-08-09: an unauthenticated call reached event-type validation, not 401). The Bearer key is still sent so hidden event types resolve. Books by eventTypeId when given, else falls back to eventTypeSlug + username from CAL_EVENT_TYPE_SLUG / CAL_USERNAME.",
-      "retryOnFail": true,
-      "maxTries": 3,
-      "waitBetweenTries": 5000
+      "notes": "No retryOnFail: POST /v2/bookings is not idempotent, so a retry can create a second meeting for the same visitor. A genuine failure routes to Respond Error and the agent asks for another time."
     },
     {
       "parameters": {
@@ -344,7 +341,7 @@
         1200,
         320
       ],
-      "notes": "Webhook responseMode is lastNode, so this Set node IS the HTTP response body the caller receives."
+      "notes": "Kept as the shaping node and for the execution log. It is no longer the HTTP response body -- the webhook answers onReceived and the agent learns the outcome from Notify Agent OK."
     },
     {
       "parameters": {
@@ -380,7 +377,73 @@
         980,
         700
       ],
-      "notes": "Every error path ends here so the caller always gets a JSON body instead of a timeout. n8n cannot set a 4xx/5xx status from a Set node, so the ok flag is the contract -- callers must check it, not just the HTTP code."
+      "notes": "Every error path ends here. It is no longer the HTTP response body -- the webhook answers onReceived -- so Notify Agent Error is what actually reaches the agent. The ok flag is still the contract."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.AGENT_CALLBACK_URL }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  session_id: $('Actions Webhook').item.json.body?.session_id ?? null,\n  action: $('Sync Booking State').item.json.action,\n  ok: true,\n  booking_uid: $('Sync Booking State').item.json.uid,\n  status: $('Sync Booking State').item.json.status,\n  start: $('Sync Booking State').item.json.start,\n  meeting_url: $('Sync Booking State').item.json.meetingUrl,\n  execution_id: $execution.id,\n}) }}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "d1000000-0000-4000-8000-0000000000a1",
+      "name": "Notify Agent OK",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        980,
+        140
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "notes": "Tells the agent the booking is real, BEFORE Write Booking State. Positioned above it so v1 execution order runs it first: the Supabase write allows 15s and retries 3x5s, and the visitor is waiting on this answer in the chat.",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_HEADER_AUTH_CRED_ID",
+          "name": "Sales Agent Webhook Secret"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.AGENT_CALLBACK_URL }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  session_id: $('Actions Webhook').item.json.body?.session_id ?? null,\n  action: $('Actions Webhook').item.json.body?.action ?? 'book',\n  ok: false,\n  error: String($json.error ?? 'booking action failed').slice(0, 400),\n  execution_id: $execution.id,\n}) }}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "d1000000-0000-4000-8000-0000000000a2",
+      "name": "Notify Agent Error",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1200,
+        700
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "notes": "Tells the agent the action failed, so it says so instead of waiting out its timeout and answering 'still confirming'.",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_HEADER_AUTH_CRED_ID",
+          "name": "Sales Agent Webhook Secret"
+        }
+      }
     }
   ],
   "connections": {
@@ -496,6 +559,11 @@
       "main": [
         [
           {
+            "node": "Notify Agent OK",
+            "type": "main",
+            "index": 0
+          },
+          {
             "node": "Write Booking State",
             "type": "main",
             "index": 0
@@ -522,6 +590,17 @@
         [
           {
             "node": "Respond Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Respond Error": {
+      "main": [
+        [
+          {
+            "node": "Notify Agent Error",
             "type": "main",
             "index": 0
           }

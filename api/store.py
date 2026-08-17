@@ -43,6 +43,16 @@ class Session:
     proposal_requested: bool = False
     handoff_requested: bool = False
     cal_booking_uid: str | None = None
+    # The booking action currently in flight, or the last one that finished:
+    # {action, start_iso, human, fired_at, state} with state in
+    # pending | confirmed | failed.
+    #
+    # `pending` is a lock, not just a label. Booking is now asynchronous -- the
+    # outcome arrives on /api/cal-callback -- so without it a visitor naming a
+    # second date before the first ack lands fires a second Cal.com booking.
+    # That is exactly how one conversation produced four real meetings.
+    booking_intent: dict[str, Any] | None = None
+    booking_error: str | None = None
     # A corrected slot proposed by the server (for example, weekend -> next
     # Monday at the same time). It is never booked until the visitor explicitly
     # confirms it in a later turn.

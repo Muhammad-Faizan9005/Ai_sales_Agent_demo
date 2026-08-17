@@ -9,7 +9,10 @@ page names -- the page *content* arrives per turn from api/retrieval.py.
 
 Event types on the wire:
     token    incremental assistant text
-    tool     a tool ran (widget uses this for a status line)
+    tool     a tool is running (widget uses this for a status line). Sent
+             BEFORE the call, so a long booking wait is visible while it happens
+    working  the tool named in the last `tool` frame is still going. A keepalive
+             for the booking handshake; ignore it if you do not need it
     handoff  open live chat
     done     turn complete
     error    unrecoverable
@@ -40,6 +43,13 @@ from api.store import SESSIONS, Session, persist
 log = logging.getLogger("chat")
 
 HANDOFF_MARKER = "__HANDOFF__"
+
+# How often to emit a `working` frame while a tool runs. Booking can legitimately
+# take tens of seconds now that it waits for n8n's callback.
+TOOL_HEARTBEAT_SECONDS = 5.0
+
+# Strong references to in-flight tool tasks; see the comment at the call site.
+_dispatching: set[asyncio.Task] = set()
 
 
 def _sse(event: str, data: dict[str, Any]) -> str:
@@ -81,6 +91,15 @@ def _build_messages(
                 "content": f"[The visitor is currently on the page {page_path}]",
             }
         )
+
+    # Booking state, rebuilt on EVERY call including tool rounds. This is what
+    # closes the loop on an asynchronous booking: the acknowledgement can land
+    # after the turn that fired it has already answered, so the model cannot be
+    # left to infer the state from a tool result it saw once. Without it the
+    # agent forgets a confirmed meeting and books a second one.
+    booking = tools.booking_state_note(session)
+    if booking:
+        messages.append({"role": "user", "content": booking})
 
     if kb_context:
         # Ahead of history, not appended after it: on a tool round the last
@@ -200,14 +219,42 @@ async def _run_turn_locked(
 
             for call in pending_calls:
                 name, args = normalise_tool_call(call)
-                result = await tools.dispatch(name, session, args)
+
+                # Announced BEFORE the tool runs, not after it returns.
+                # book_meeting now waits on n8n's callback for up to
+                # CAL_ACK_TIMEOUT_SECONDS, and the widget maps this frame to
+                # "Booking your meeting..." -- emitting it first is what turns a
+                # silent blinking cursor into a status line for the whole wait.
+                yield _sse("tool", {"name": name})
+
+                task = asyncio.create_task(tools.dispatch(name, session, args))
+                # asyncio only weakly references tasks. Without a strong one, a
+                # booking still in flight after the visitor closed the tab could
+                # be garbage-collected mid-request -- and its Cal.com booking
+                # would never be acknowledged. Same reason n8n_client keeps
+                # _pending.
+                _dispatching.add(task)
+                task.add_done_callback(_dispatching.discard)
+
+                while True:
+                    done, _ = await asyncio.wait({task}, timeout=TOOL_HEARTBEAT_SECONDS)
+                    if done:
+                        break
+                    # Keeps a long booking wait flowing: proxies buffer or drop a
+                    # stream that goes quiet for 45s. Both the widget and the
+                    # console ignore event names they do not know.
+                    yield _sse("working", {"name": name})
+
+                result = task.result()
 
                 if result.startswith(HANDOFF_MARKER):
                     handoff = True
                     result = result[len(HANDOFF_MARKER) :].strip()
 
                 session.add("tool", result, tool_name=name)
-                yield _sse("tool", {"name": name})
+                # No second `tool` frame here -- one was already sent before the
+                # call. Emitting both made the widget print "Booking your
+                # meeting..." twice.
                 if debug:
                     # Arguments and the raw result string. Tool results are
                     # instructions addressed to the model ("ASK: ...",
