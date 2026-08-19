@@ -1,4 +1,4 @@
-{
+﻿{
   "name": "sales-agent-events (local)",
   "nodes": [
     {
@@ -416,7 +416,7 @@
         "operation": "send",
         "phoneNumberId": "={{ $env.WHATSAPP_PHONE_NUMBER_ID }}",
         "recipientPhoneNumber": "={{ $env.SALES_LEAD_WHATSAPP }}",
-        "textBody": "=HOT LEAD from the website agent\n\n{{ $('Webhook').item.json.body.fields.visitor_name }} — {{ $('Webhook').item.json.body.fields.company_name }}\n{{ $('Webhook').item.json.body.fields.visitor_email }} / {{ $('Webhook').item.json.body.fields.visitor_phone }}\nInterested in: {{ $('Webhook').item.json.body.fields.service_recommended }}\n\nCRM: {{ $env.AGENT_PUBLIC_URL }}/api/dashboard/?session_id={{ $('Upsert Supabase Lead').item.json.id }}",
+        "textBody": "=HOT LEAD from the website agent\n\n{{ $('Webhook').item.json.body.fields.visitor_name }} â€” {{ $('Webhook').item.json.body.fields.company_name }}\n{{ $('Webhook').item.json.body.fields.visitor_email }} / {{ $('Webhook').item.json.body.fields.visitor_phone }}\nInterested in: {{ $('Webhook').item.json.body.fields.service_recommended }}\n\nCRM: {{ $env.AGENT_PUBLIC_URL }}/api/dashboard/?session_id={{ $('Upsert Supabase Lead').item.json.id }}",
         "additionalFields": {}
       },
       "id": "a1000000-0000-4000-8000-000000000016",
@@ -445,7 +445,7 @@
         "operation": "send",
         "fromEmail": "={{ $env.NOTIFY_FROM_EMAIL }}",
         "toEmail": "={{ $env.SALES_TEAM_EMAIL }}",
-        "subject": "=New {{ $('Webhook').item.json.body.score }} lead — {{ $('Webhook').item.json.body.fields.company_name || $('Webhook').item.json.body.fields.visitor_name }}",
+        "subject": "=New {{ $('Webhook').item.json.body.score }} lead â€” {{ $('Webhook').item.json.body.fields.company_name || $('Webhook').item.json.body.fields.visitor_name }}",
         "text": "=A visitor qualified through the AI sales agent.\n\nName:    {{ $('Webhook').item.json.body.fields.visitor_name }}\nEmail:   {{ $('Webhook').item.json.body.fields.visitor_email }}\nPhone:   {{ $('Webhook').item.json.body.fields.visitor_phone }}\nCompany: {{ $('Webhook').item.json.body.fields.company_name }}\nService: {{ $('Webhook').item.json.body.fields.service_recommended }}\nScore:   {{ $('Webhook').item.json.body.score }}\n\nPages the agent walked them through:\n{{ JSON.stringify($('Webhook').item.json.body.pages_visited ?? []) }}\n\nLead: {{ $env.AGENT_PUBLIC_URL }}/api/dashboard/?session_id={{ $('Upsert Supabase Lead').item.json.id }}\nSession: {{ $('Webhook').item.json.body.session_id }}",
         "jsonParameters": false,
         "additionalFields": {
@@ -605,7 +605,7 @@
         "operation": "send",
         "fromEmail": "={{ $env.NOTIFY_FROM_EMAIL }}",
         "toEmail": "={{ $env.SALES_TEAM_EMAIL }}",
-        "subject": "=Meeting booked — {{ $('Meeting Details').item.json.visitorName }} — {{ $('Meeting Details').item.json.whenLocal }}",
+        "subject": "=Meeting booked â€” {{ $('Meeting Details').item.json.visitorName }} â€” {{ $('Meeting Details').item.json.whenLocal }}",
         "text": "=The AI sales agent booked a meeting and a task is on your board.\n\nWhen:    {{ $('Meeting Details').item.json.whenLocal }}\nWith:    {{ $('Meeting Details').item.json.visitorName }} ({{ $('Meeting Details').item.json.visitorEmail }})\nCompany: {{ $('Meeting Details').item.json.companyName }}\n\nJoin:       {{ $('Meeting Details').item.json.joinUrl }}\nReschedule: {{ $('Meeting Details').item.json.rescheduleUrl }}\nCancel:     {{ $('Meeting Details').item.json.cancelUrl }}\n\nLead: {{ $env.AGENT_PUBLIC_URL }}/api/dashboard/?session_id={{ $('Meeting Details').item.json.crm_lead_id }}\n",
         "jsonParameters": false,
         "additionalFields": {
@@ -732,7 +732,7 @@
         "operation": "send",
         "fromEmail": "={{ $env.NOTIFY_FROM_EMAIL }}",
         "toEmail": "={{ $env.SALES_TEAM_EMAIL }}",
-        "subject": "=Proposal requested — {{ $('Webhook').item.json.body.fields.company_name || $('Webhook').item.json.body.fields.visitor_name }}",
+        "subject": "=Proposal requested â€” {{ $('Webhook').item.json.body.fields.company_name || $('Webhook').item.json.body.fields.visitor_name }}",
         "text": "=A visitor requested a proposal through the AI sales agent.\n\nName:    {{ $('Webhook').item.json.body.fields.visitor_name }}\nEmail:   {{ $('Webhook').item.json.body.fields.visitor_email }}\nPhone:   {{ $('Webhook').item.json.body.fields.visitor_phone }}\nCompany: {{ $('Webhook').item.json.body.fields.company_name }}\nService: {{ $('Webhook').item.json.body.fields.service_recommended }}\n\nLead: {{ $env.AGENT_PUBLIC_URL }}/api/dashboard/?session_id={{ $('Lookup Lead (proposal)').item.json.crm_lead_id }}\nA follow-up task has been created on the lead.",
         "jsonParameters": false,
         "additionalFields": {
@@ -869,7 +869,7 @@
         "operation": "send",
         "fromEmail": "={{ $env.NOTIFY_FROM_EMAIL }}",
         "toEmail": "={{ $('Meeting Details').item.json.visitorEmail }}",
-        "subject": "=Your meeting is confirmed — {{ $('Meeting Details').item.json.whenLocal }}",
+        "subject": "=Your meeting is confirmed â€” {{ $('Meeting Details').item.json.whenLocal }}",
         "text": "=Hi {{ $('Meeting Details').item.json.visitorName }},\n\nYour meeting with Systematic IT Solutions is confirmed.\n\nWhen: {{ $('Meeting Details').item.json.whenLocal }}\nJoin:  {{ $('Meeting Details').item.json.joinUrl }}\n\nNeed a different time?\nReschedule: {{ $('Meeting Details').item.json.rescheduleUrl }}\nCancel:     {{ $('Meeting Details').item.json.cancelUrl }}\n\nTalk soon,\nSystematic IT Solutions\n",
         "jsonParameters": false,
         "additionalFields": {
@@ -1239,3 +1239,4 @@
   "pinData": {},
   "tags": []
 }
+

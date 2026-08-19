@@ -114,12 +114,19 @@
         <option value="false">not booked</option>
       </select>
       <button onclick="refresh()">Refresh</button>
+      <button onclick="showSheet()">Sheet</button>
+      <button class="primary" onclick="exportCsv()">Export CSV</button>
       <button onclick="signOut()">Lock</button>
     </div>
   </header>
 
   <main>
     <div class="tiles" id="tiles"></div>
+
+    <div class="card" id="sheetView" hidden>
+      <h2>Supabase lead sheet</h2>
+      <div id="sheetTable"><div class="empty">loading...</div></div>
+    </div>
 
     <div class="card">
       <h2>Conversations</h2>
@@ -277,6 +284,35 @@ async function loadRuns() {
   }
   table.append(body);
   box.append(table);
+}
+
+async function showSheet() {
+  const view = document.getElementById('sheetView');
+  view.hidden = false;
+  const data = await api('/sheet');
+  const box = document.getElementById('sheetTable');
+  box.textContent = '';
+  if (!data.items.length) { box.append(el('div', 'empty', 'No leads captured yet.')); return; }
+  const table = el('table');
+  table.append(thead(['Captured', 'Session', 'Name', 'Email', 'Phone', 'Company', 'Service', 'Score', 'Lead ID']));
+  const body = el('tbody');
+  data.items.forEach(r => {
+    const tr = el('tr');
+    tr.onclick = () => openDetail(r.session_id);
+    [when(r.captured_at), r.session_id, r.name, r.email, r.phone, r.company,
+      r.service, r.score, r.lead_id].forEach((v, i) => tr.append(el('td', i === 0 ? 'muted' : null, v || '—')));
+    body.append(tr);
+  });
+  table.append(body); box.append(table);
+}
+
+async function exportCsv() {
+  const res = await fetch(API + '/sheet.csv', { headers: { 'X-Dashboard-Token': token } });
+  if (!res.ok) { if (res.status === 401) signOut('Token rejected.'); return; }
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href = url; a.download = 'leads.csv'; a.click();
+  URL.revokeObjectURL(url);
 }
 
 function simpleTable(rows, cols, emptyMsg) {

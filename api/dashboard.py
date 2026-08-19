@@ -18,11 +18,13 @@ n8n fan-out.
 from __future__ import annotations
 
 import logging
+import csv
+import io
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel, Field
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 
 from api.config import get_settings
 from api.store import _connect
@@ -48,6 +50,11 @@ LIST_COLUMNS = """
     messages_count, crm_synced AS lead_persisted, crm_lead_id AS lead_id, sheets_synced,
     notification_sent, cal_booking_status, meeting_start_at, error
 """
+
+SHEET_COLUMNS = (
+    "captured_at", "session_id", "name", "email", "phone", "company",
+    "service", "score", "lead_id",
+)
 
 
 def require_token(x_dashboard_token: str = Header(default="")) -> None:
@@ -145,6 +152,42 @@ def runs(
         "offset": offset,
         "items": items,
     }
+
+
+@router.get("/sheet", dependencies=[Depends(require_token)])
+def sheet(limit: int = Query(default=200, ge=1, le=1000), offset: int = Query(default=0, ge=0)) -> dict[str, Any]:
+    """Lead rows for the dashboard's spreadsheet-style view."""
+    rows = _rows(
+        """SELECT started_at AS captured_at, session_id, visitor_name AS name,
+                  visitor_email AS email, visitor_phone AS phone,
+                  company_name AS company, service_recommended AS service,
+                  lead_status AS score, COALESCE(crm_lead_id, session_id) AS lead_id
+           FROM agent_runs ORDER BY started_at DESC LIMIT %s OFFSET %s""",
+        (limit, offset),
+    )
+    return {"columns": list(SHEET_COLUMNS), "items": rows}
+
+
+@router.get("/sheet.csv", dependencies=[Depends(require_token)])
+def sheet_csv(limit: int = Query(default=1000, ge=1, le=5000)) -> StreamingResponse:
+    """Download the Supabase-backed lead view as CSV."""
+    rows = _rows(
+        """SELECT started_at AS captured_at, session_id, visitor_name AS name,
+                  visitor_email AS email, visitor_phone AS phone,
+                  company_name AS company, service_recommended AS service,
+                  lead_status AS score, COALESCE(crm_lead_id, session_id) AS lead_id
+           FROM agent_runs ORDER BY started_at DESC LIMIT %s""",
+        (limit,),
+    )
+    out = io.StringIO(newline="")
+    writer = csv.DictWriter(out, fieldnames=SHEET_COLUMNS, extrasaction="ignore")
+    writer.writeheader()
+    writer.writerows(rows)
+    out.seek(0)
+    return StreamingResponse(
+        iter([out.getvalue()]), media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="leads.csv"'},
+    )
 
 
 @router.patch("/runs/{session_id}", dependencies=[Depends(require_token)])
