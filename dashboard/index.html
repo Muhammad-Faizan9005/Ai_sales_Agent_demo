@@ -208,7 +208,7 @@ async function loadStats() {
     tile('Meetings', s.meetings, pct(s.conversion_rate) + ' of leads'),
     tile('Proposals', s.proposals),
     tile('Hot / Warm / Cold', `${s.hot} / ${s.warm} / ${s.cold}`),
-    tile('CRM synced', s.crm_synced, s.errored ? s.errored + ' with errors' : 'no errors'),
+    tile('Lead records', s.lead_persisted, s.errored ? s.errored + ' with errors' : 'no errors'),
   );
   document.getElementById('sub').textContent =
     `${s.meetings} meeting${s.meetings === 1 ? '' : 's'} from ${s.leads} lead${s.leads === 1 ? '' : 's'}`;
@@ -270,7 +270,7 @@ async function loadRuns() {
       el('td', 'muted', r.messages_count ?? 0),
       el('td', 'muted', mins(r.duration_ms)),
     );
-    const crm = el('td', r.crm_synced ? 'tick' : 'no', r.crm_synced ? 'ok' : '—');
+    const crm = el('td', r.lead_persisted ? 'tick' : 'no', r.lead_persisted ? 'ok' : '—');
     if (r.error) crm.append(el('div', 'err', 'error'));
     tr.append(crm);
     body.append(tr);
@@ -330,7 +330,7 @@ async function openDetail(sessionId) {
     ['Website', r.website_url], ['Industry', r.industry],
     ['Grade', r.lead_status], ['Service', r.service_recommended],
     ['Meeting', r.meeting_booked ? when(r.meeting_start_at) : 'not booked'],
-    ['CRM lead', r.crm_lead_id], ['Pages', (r.pages_visited || []).join(' → ')],
+    ['Lead ID', r.lead_id], ['Pages', (r.pages_visited || []).join(' → ')],
     ['Actions', (r.actions_taken || []).join(', ')],
   ];
   for (const [k, v] of pairs) {
@@ -372,4 +372,3 @@ document.getElementById('tok')
   .addEventListener('keydown', e => { if (e.key === 'Enter') signIn(); });
 boot();
 </script>
-

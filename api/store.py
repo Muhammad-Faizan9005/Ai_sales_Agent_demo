@@ -195,6 +195,12 @@ def persist(session: Session, lead_status: str | None = None) -> bool:
     Never raises: the caller is a chat turn, and a failed write must not become
     a failed reply.
     """
+    # Lead ownership belongs to n8n. FastAPI keeps the live conversation in
+    # memory and sends the complete lead payload in lead_created; n8n is the
+    # first writer of agent_runs/Supabase. This guard prevents partial turns
+    # from creating rows before the workflow receives the event.
+    return False
+
     conn = _connect()
     if conn is None:
         return False

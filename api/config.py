@@ -1,9 +1,4 @@
-"""Settings for the AI Sales Agent.
-
-Every credential is read through this module -- never os.environ at the call
-site. Mirrors the AliasChoices convention used by AutoCRM's AI_service so the
-same .env keys work across both projects.
-"""
+"""Settings for the AI Sales Agent."""
 
 from __future__ import annotations
 

@@ -68,6 +68,12 @@ CREATE TABLE IF NOT EXISTS agent_runs (
   error               TEXT,           -- written by sales-agent-error-handler
   language            TEXT DEFAULT 'en',
 
+  -- Demo ownership. n8n fills these from SALES_REP_NAME / SALES_REP_EMAIL.
+  assigned_rep_name   TEXT,
+  assigned_rep_email  TEXT,
+  latest_notification_type TEXT,
+  latest_notification_at   TIMESTAMPTZ,
+
   created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -77,6 +83,11 @@ CREATE TABLE IF NOT EXISTS agent_runs (
 -- every future column must be added.
 ALTER TABLE agent_runs
   ADD COLUMN IF NOT EXISTS crm_task_id        TEXT,
+  ADD COLUMN IF NOT EXISTS updated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  ADD COLUMN IF NOT EXISTS assigned_rep_name  TEXT,
+  ADD COLUMN IF NOT EXISTS assigned_rep_email TEXT,
+  ADD COLUMN IF NOT EXISTS latest_notification_type TEXT,
+  ADD COLUMN IF NOT EXISTS latest_notification_at TIMESTAMPTZ,
   ADD COLUMN IF NOT EXISTS cal_booking_uid    TEXT,
   ADD COLUMN IF NOT EXISTS cal_booking_status TEXT,
   ADD COLUMN IF NOT EXISTS cal_meeting_url    TEXT,
@@ -102,6 +113,36 @@ CREATE TABLE IF NOT EXISTS faq_summary (
   last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS sales_tasks (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  session_id  TEXT NOT NULL REFERENCES agent_runs(session_id) ON DELETE CASCADE,
+  task_type   TEXT NOT NULL CHECK (task_type IN ('meeting_prep', 'proposal_followup')),
+  title       TEXT NOT NULL,
+  description TEXT,
+  due_at      TIMESTAMPTZ,
+  status      TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'completed', 'canceled')),
+  priority    TEXT NOT NULL DEFAULT 'high',
+  assigned_rep_name  TEXT,
+  assigned_rep_email TEXT,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (session_id, task_type)
+);
+
+CREATE TABLE IF NOT EXISTS lead_notifications (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  session_id  TEXT NOT NULL REFERENCES agent_runs(session_id) ON DELETE CASCADE,
+  type        TEXT NOT NULL,
+  message     TEXT NOT NULL,
+  scheduled_at TIMESTAMPTZ,
+  assigned_rep_name  TEXT,
+  assigned_rep_email TEXT,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_sales_tasks_session ON sales_tasks (session_id);
+CREATE INDEX IF NOT EXISTS idx_lead_notifications_session ON lead_notifications (session_id, created_at DESC);
+
 -- Deny-all RLS. Not optional.
 --
 -- Supabase publishes every table in `public` through PostgREST, so without this
@@ -119,6 +160,90 @@ CREATE TABLE IF NOT EXISTS faq_summary (
 -- or a direct connection), never with the anon key from the browser.
 ALTER TABLE agent_runs  ENABLE ROW LEVEL SECURITY;
 ALTER TABLE faq_summary ENABLE ROW LEVEL SECURITY;
+ALTER TABLE sales_tasks ENABLE ROW LEVEL SECURITY;
+ALTER TABLE lead_notifications ENABLE ROW LEVEL SECURITY;
+
+CREATE OR REPLACE FUNCTION upsert_agent_lead(
+  p_session_id TEXT, p_visitor_name TEXT DEFAULT NULL, p_visitor_email TEXT DEFAULT NULL,
+  p_visitor_phone TEXT DEFAULT NULL, p_company_name TEXT DEFAULT NULL,
+  p_website_url TEXT DEFAULT NULL, p_industry TEXT DEFAULT NULL,
+  p_service_recommended TEXT DEFAULT NULL, p_lead_status TEXT DEFAULT NULL,
+  p_transcript JSONB DEFAULT NULL, p_pages_visited JSONB DEFAULT NULL,
+  p_assigned_rep_name TEXT DEFAULT NULL, p_assigned_rep_email TEXT DEFAULT NULL
+) RETURNS JSONB LANGUAGE plpgsql SET search_path = public AS $$
+DECLARE v_run agent_runs;
+BEGIN
+  INSERT INTO agent_runs (
+    session_id, visitor_name, visitor_email, visitor_phone, company_name,
+    website_url, industry, service_recommended, lead_status, transcript,
+    pages_visited, crm_synced, crm_lead_id, assigned_rep_name, assigned_rep_email
+  ) VALUES (
+    p_session_id, p_visitor_name, p_visitor_email, p_visitor_phone, p_company_name,
+    p_website_url, p_industry, p_service_recommended, p_lead_status, p_transcript,
+    p_pages_visited, true, p_session_id, p_assigned_rep_name, p_assigned_rep_email
+  ) ON CONFLICT (session_id) DO UPDATE SET
+    visitor_name = COALESCE(p_visitor_name, agent_runs.visitor_name),
+    visitor_email = COALESCE(p_visitor_email, agent_runs.visitor_email),
+    visitor_phone = COALESCE(p_visitor_phone, agent_runs.visitor_phone),
+    company_name = COALESCE(p_company_name, agent_runs.company_name),
+    website_url = COALESCE(p_website_url, agent_runs.website_url),
+    industry = COALESCE(p_industry, agent_runs.industry),
+    service_recommended = COALESCE(p_service_recommended, agent_runs.service_recommended),
+    lead_status = COALESCE(p_lead_status, agent_runs.lead_status),
+    transcript = COALESCE(p_transcript, agent_runs.transcript),
+    pages_visited = COALESCE(p_pages_visited, agent_runs.pages_visited),
+    crm_synced = true, crm_lead_id = agent_runs.session_id,
+    assigned_rep_name = COALESCE(p_assigned_rep_name, agent_runs.assigned_rep_name),
+    assigned_rep_email = COALESCE(p_assigned_rep_email, agent_runs.assigned_rep_email),
+    updated_at = now()
+  RETURNING * INTO v_run;
+  RETURN jsonb_build_object('id', v_run.session_id, 'session_id', v_run.session_id, 'synced', true);
+END; $$;
+
+CREATE OR REPLACE FUNCTION create_sales_task(
+  p_session_id TEXT, p_task_type TEXT, p_title TEXT, p_description TEXT DEFAULT NULL,
+  p_due_at TIMESTAMPTZ DEFAULT NULL, p_assigned_rep_name TEXT DEFAULT NULL,
+  p_assigned_rep_email TEXT DEFAULT NULL
+) RETURNS JSONB LANGUAGE plpgsql SET search_path = public AS $$
+DECLARE v_id UUID;
+BEGIN
+  INSERT INTO sales_tasks(session_id, task_type, title, description, due_at, assigned_rep_name, assigned_rep_email)
+  VALUES (p_session_id, p_task_type, p_title, p_description, p_due_at, p_assigned_rep_name, p_assigned_rep_email)
+  ON CONFLICT (session_id, task_type) DO UPDATE SET
+    title = EXCLUDED.title, description = EXCLUDED.description,
+    due_at = COALESCE(EXCLUDED.due_at, sales_tasks.due_at), status = 'open',
+    assigned_rep_name = EXCLUDED.assigned_rep_name,
+    assigned_rep_email = EXCLUDED.assigned_rep_email, updated_at = now()
+  RETURNING id INTO v_id;
+  UPDATE agent_runs SET crm_task_id = v_id::text, updated_at = now() WHERE session_id = p_session_id;
+  RETURN jsonb_build_object('id', v_id, 'session_id', p_session_id);
+END; $$;
+
+CREATE OR REPLACE FUNCTION update_sales_task(
+  p_task_id UUID, p_status TEXT DEFAULT NULL, p_due_at TIMESTAMPTZ DEFAULT NULL,
+  p_description TEXT DEFAULT NULL
+) RETURNS INTEGER LANGUAGE sql SET search_path = public AS $$
+  UPDATE sales_tasks SET status = COALESCE(p_status, status), due_at = COALESCE(p_due_at, due_at),
+    description = COALESCE(p_description, description), updated_at = now()
+  WHERE id = p_task_id;
+  SELECT 1;
+$$;
+
+CREATE OR REPLACE FUNCTION create_lead_notification(
+  p_session_id TEXT, p_type TEXT, p_message TEXT, p_scheduled_at TIMESTAMPTZ DEFAULT NULL,
+  p_assigned_rep_name TEXT DEFAULT NULL, p_assigned_rep_email TEXT DEFAULT NULL
+) RETURNS UUID LANGUAGE plpgsql SET search_path = public AS $$
+DECLARE v_id UUID;
+BEGIN
+  INSERT INTO lead_notifications(session_id, type, message, scheduled_at, assigned_rep_name, assigned_rep_email)
+  VALUES (p_session_id, p_type, p_message, p_scheduled_at, p_assigned_rep_name, p_assigned_rep_email)
+  RETURNING id INTO v_id;
+  UPDATE agent_runs SET latest_notification_type = p_type, latest_notification_at = now(),
+    assigned_rep_name = COALESCE(p_assigned_rep_name, assigned_rep_name),
+    assigned_rep_email = COALESCE(p_assigned_rep_email, assigned_rep_email), updated_at = now()
+  WHERE session_id = p_session_id;
+  RETURN v_id;
+END; $$;
 
 -- ---------------------------------------------------------------------------
 -- RPC surface for n8n

@@ -63,14 +63,14 @@
         }
       },
       "onError": "continueErrorOutput",
-      "notes": "Single statement: matches on the old uid (or session_id), writes the new uid, status, start time and meeting_booked, and RETURNs the row so we get crm_lead_id / crm_task_id without a second query.",
+      "notes": "Single statement: matches on the old uid (or session_id), writes the new uid, status, start time and meeting_booked, and RETURNs the row so we get lead_id / task_id without a second query.",
       "retryOnFail": true,
       "maxTries": 3,
       "waitBetweenTries": 5000
     },
     {
       "parameters": {
-        "jsCode": "// apply_cal_booking_event returns the matched row, or [] when the booking was\n// made straight from the public Cal.com page by someone who never used the chat\n// agent. That is an ordinary outcome, so stop quietly instead of erroring.\nconst rows = $input.first().json;\nconst row  = Array.isArray(rows) ? rows[0] : rows;\nconst n    = $('Normalise Cal Event').item.json;\n\nif (!row || !row.session_id) {\n  return [];   // unknown booking -> no agent_runs row -> nothing to sync\n}\n\nreturn [{\n  json: {\n    ...n,\n    session_id:  row.session_id,\n    crm_lead_id: row.crm_lead_id,\n    crm_task_id: row.crm_task_id,\n    // Prefer the name/email already on the run; the Cal payload can carry a\n    // different attendee than the visitor who started the conversation.\n    visitorName:  row.visitor_name  || n.attendeeName  || 'there',\n    visitorEmail: row.visitor_email || n.attendeeEmail || '',\n    hasTask: Boolean(row.crm_task_id),\n  },\n}];"
+        "jsCode": "// apply_cal_booking_event returns the matched row, or [] when the booking was\n// made straight from the public Cal.com page by someone who never used the chat\n// agent. That is an ordinary outcome, so stop quietly instead of erroring.\nconst rows = $input.first().json;\nconst row  = Array.isArray(rows) ? rows[0] : rows;\nconst n    = $('Normalise Cal Event').item.json;\n\nif (!row || !row.session_id) {\n  return [];   // unknown booking -> no agent_runs row -> nothing to sync\n}\n\nreturn [{\n  json: {\n    ...n,\n    session_id:  row.session_id,\n    lead_id: row.session_id,\n    task_id: row.task_id,\n    // Prefer the name/email already on the run; the Cal payload can carry a\n    // different attendee than the visitor who started the conversation.\n    visitorName:  row.visitor_name  || n.attendeeName  || 'there',\n    visitorEmail: row.visitor_email || n.attendeeEmail || '',\n    hasTask: Boolean(row.task_id),\n  },\n}];"
       },
       "id": "c1000000-0000-4000-8000-000000000004",
       "name": "Resolve Run",
@@ -82,51 +82,6 @@
       ],
       "onError": "continueErrorOutput",
       "notes": "Returns [] for bookings with no agent_runs row -- a booking made outside the agent. Stops the branch quietly."
-    },
-    {
-      "parameters": {
-        "method": "POST",
-        "url": "={{ $env.AUTOCRM_BASE_URL }}/api/auth/login",
-        "sendBody": true,
-        "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ email: $env.AUTOCRM_SERVICE_EMAIL, password: $env.AUTOCRM_SERVICE_PASSWORD }) }}",
-        "options": {
-          "response": {
-            "response": {
-              "fullResponse": true,
-              "neverError": false
-            }
-          },
-          "timeout": 15000
-        }
-      },
-      "id": "c1000000-0000-4000-8000-000000000010",
-      "name": "AutoCRM Login",
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [
-        900,
-        320
-      ],
-      "onError": "continueErrorOutput",
-      "notes": "Same cookie-auth bootstrap as the events workflow. Login is CSRF-exempt.",
-      "retryOnFail": true,
-      "maxTries": 3,
-      "waitBetweenTries": 5000
-    },
-    {
-      "parameters": {
-        "jsCode": "const res = $input.first().json;\nconst raw = res.headers?.['set-cookie'] ?? [];\nconst list = Array.isArray(raw) ? raw : [raw];\nconst jar = {};\nfor (const entry of list) {\n  const [pair] = String(entry).split(';');\n  const eq = pair.indexOf('=');\n  if (eq === -1) continue;\n  jar[pair.slice(0, eq).trim()] = pair.slice(eq + 1).trim();\n}\nif (!jar.access_token) throw new Error('AutoCRM login returned no access_token cookie.');\nreturn [{ json: {\n  cookieHeader: `access_token=${jar.access_token}; csrf_token=${jar.csrf_token ?? ''}`,\n  csrfToken: jar.csrf_token ?? '',\n} }];"
-      },
-      "id": "c1000000-0000-4000-8000-000000000011",
-      "name": "Extract Cookies",
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "position": [
-        1120,
-        320
-      ],
-      "onError": "continueErrorOutput"
     },
     {
       "parameters": {
@@ -161,34 +116,23 @@
         1340,
         320
       ],
-      "notes": "Runs before lead_created recorded a task, or for bookings made outside the agent, crm_task_id is null. Skip the PATCH instead of hitting /api/tasks/undefined."
+      "notes": "Runs before lead_created recorded a task, or for bookings made outside the agent, task_id is null. Skip the PATCH instead of hitting /api/tasks/undefined."
     },
     {
       "parameters": {
-        "method": "PATCH",
-        "url": "={{ $env.AUTOCRM_BASE_URL }}/api/tasks/{{ $('Resolve Run').item.json.crm_task_id }}",
-        "sendHeaders": true,
-        "headerParameters": {
-          "parameters": [
-            {
-              "name": "Cookie",
-              "value": "={{ $('Extract Cookies').item.json.cookieHeader }}"
-            },
-            {
-              "name": "X-CSRF-Token",
-              "value": "={{ $('Extract Cookies').item.json.csrfToken }}"
-            }
-          ]
-        },
+        "method": "POST",
+        "url": "={{ $env.SUPABASE_URL }}/rest/v1/rpc/update_sales_task",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "supabaseApi",
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify($('Resolve Run').item.json.isCancel ? {\n  status: 'canceled',\n  description: 'Meeting CANCELLED on Cal.com.'\n    + ($('Resolve Run').item.json.cancellationReason\n        ? '\\nReason: ' + $('Resolve Run').item.json.cancellationReason : ''),\n} : {\n  due_at: $('Resolve Run').item.json.startISO,\n  description: 'Meeting RESCHEDULED on Cal.com.\\n\\nNew time: '\n    + $('Resolve Run').item.json.whenLocal\n    + '\\nJoin: ' + $('Resolve Run').item.json.meetingUrl,\n}) }}",
+        "jsonBody": "={{ JSON.stringify($('Resolve Run').item.json.isCancel ? {\n  p_task_id: $('Resolve Run').item.json.task_id,\n  p_status: 'canceled',\n  p_description: 'Meeting CANCELLED on Cal.com.' + ($('Resolve Run').item.json.cancellationReason ? '\\nReason: ' + $('Resolve Run').item.json.cancellationReason : ''),\n} : {\n  p_task_id: $('Resolve Run').item.json.task_id,\n  p_due_at: $('Resolve Run').item.json.startISO,\n  p_description: 'Meeting RESCHEDULED on Cal.com. New time: ' + $('Resolve Run').item.json.whenLocal + '. Join: ' + $('Resolve Run').item.json.meetingUrl,\n}) }}",
         "options": {
-          "timeout": 20000
+          "timeout": 15000
         }
       },
       "id": "c1000000-0000-4000-8000-000000000013",
-      "name": "Update Prep Task",
+      "name": "Update Supabase Prep Task",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
       "position": [
@@ -199,7 +143,13 @@
       "notes": "PATCH, never POST. A reschedule moves due_at on the SAME task; a cancel sets status canceled. 'canceled' is the single-l spelling AutoCRM's TASK_STATUSES uses. Non-fatal: losing the task edit must not lose the notification.",
       "retryOnFail": true,
       "maxTries": 3,
-      "waitBetweenTries": 5000
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "supabaseApi": {
+          "id": "szox4UWsZWBiuv2V",
+          "name": "Supabase account"
+        }
+      }
     },
     {
       "parameters": {
@@ -208,7 +158,7 @@
         "fromEmail": "={{ $env.NOTIFY_FROM_EMAIL }}",
         "toEmail": "={{ $env.SALES_TEAM_EMAIL }}",
         "subject": "={{ $('Resolve Run').item.json.isCancel ? 'Meeting CANCELLED' : 'Meeting rescheduled' }} — {{ $('Resolve Run').item.json.visitorName }}",
-        "text": "={{ $('Resolve Run').item.json.isCancel\n  ? 'The visitor cancelled their meeting on Cal.com.\\n\\n'\n    + 'Who:    ' + $('Resolve Run').item.json.visitorName + ' (' + $('Resolve Run').item.json.visitorEmail + ')\\n'\n    + 'Was at: ' + $('Resolve Run').item.json.whenLocal + '\\n'\n    + ($('Resolve Run').item.json.cancellationReason ? 'Reason: ' + $('Resolve Run').item.json.cancellationReason + '\\n' : '')\n    + '\\nThe prep task has been marked canceled.'\n  : 'The visitor moved their meeting on Cal.com.\\n\\n'\n    + 'Who:      ' + $('Resolve Run').item.json.visitorName + ' (' + $('Resolve Run').item.json.visitorEmail + ')\\n'\n    + 'New time: ' + $('Resolve Run').item.json.whenLocal + '\\n'\n    + 'Join:     ' + $('Resolve Run').item.json.meetingUrl + '\\n'\n    + '\\nThe task deadline has been updated.'\n}}\n\nAutoCRM lead: {{ $env.AUTOCRM_BASE_URL }}/leads/{{ $('Resolve Run').item.json.crm_lead_id }}",
+        "text": "={{ $('Resolve Run').item.json.isCancel\n  ? 'The visitor cancelled their meeting on Cal.com.\\n\\n'\n    + 'Who:    ' + $('Resolve Run').item.json.visitorName + ' (' + $('Resolve Run').item.json.visitorEmail + ')\\n'\n    + 'Was at: ' + $('Resolve Run').item.json.whenLocal + '\\n'\n    + ($('Resolve Run').item.json.cancellationReason ? 'Reason: ' + $('Resolve Run').item.json.cancellationReason + '\\n' : '')\n    + '\\nThe prep task has been marked canceled.'\n  : 'The visitor moved their meeting on Cal.com.\\n\\n'\n    + 'Who:      ' + $('Resolve Run').item.json.visitorName + ' (' + $('Resolve Run').item.json.visitorEmail + ')\\n'\n    + 'New time: ' + $('Resolve Run').item.json.whenLocal + '\\n'\n    + 'Join:     ' + $('Resolve Run').item.json.meetingUrl + '\\n'\n    + '\\nThe task deadline has been updated.'\n}}\n\nLead: {{ $env.AGENT_PUBLIC_URL }}/leads/{{ $('Resolve Run').item.json.lead_id }}",
         "jsonParameters": false,
         "additionalFields": {
           "fromName": "={{ $env.NOTIFY_FROM_NAME || 'Systematic IT Solutions' }}"
@@ -319,42 +269,6 @@
       "main": [
         [
           {
-            "node": "AutoCRM Login",
-            "type": "main",
-            "index": 0
-          }
-        ],
-        [
-          {
-            "node": "Record Failure",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "AutoCRM Login": {
-      "main": [
-        [
-          {
-            "node": "Extract Cookies",
-            "type": "main",
-            "index": 0
-          }
-        ],
-        [
-          {
-            "node": "Record Failure",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Extract Cookies": {
-      "main": [
-        [
-          {
             "node": "IF Has Task",
             "type": "main",
             "index": 0
@@ -373,7 +287,7 @@
       "main": [
         [
           {
-            "node": "Update Prep Task",
+            "node": "Update Supabase Prep Task",
             "type": "main",
             "index": 0
           }
@@ -387,7 +301,7 @@
         ]
       ]
     },
-    "Update Prep Task": {
+    "Update Supabase Prep Task": {
       "main": [
         [
           {

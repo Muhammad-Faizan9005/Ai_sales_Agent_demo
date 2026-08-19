@@ -27,3 +27,6 @@ Thumbs.db
 
 # Build artifact -- rebuild with: python kb/chunk.py && python kb/embed.py
 /kb/index/
+/presentation/*
+*.ps1
+*.zip

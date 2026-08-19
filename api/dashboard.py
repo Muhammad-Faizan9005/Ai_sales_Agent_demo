@@ -21,6 +21,7 @@ import logging
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from pydantic import BaseModel, Field
 from fastapi.responses import FileResponse
 
 from api.config import get_settings
@@ -31,6 +32,11 @@ SETTINGS = get_settings()
 
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
 
+
+class LeadUpdate(BaseModel):
+    lead_status: str | None = Field(default=None, pattern="^(hot|warm|cold|new|contacted|qualified|unqualified|junk)$")
+    handoff_requested: bool | None = None
+
 # Columns safe to list. Deliberately excludes `transcript`: a list endpoint
 # returning every full conversation is both a payload and a privacy problem.
 # The detail endpoint returns it for one run at a time.
@@ -39,7 +45,7 @@ LIST_COLUMNS = """
     visitor_name, visitor_email, visitor_phone, company_name,
     website_url, industry, lead_status, service_recommended,
     meeting_booked, proposal_requested, handoff_requested,
-    messages_count, crm_synced, crm_lead_id, sheets_synced,
+    messages_count, crm_synced AS lead_persisted, crm_lead_id AS lead_id, sheets_synced,
     notification_sent, cal_booking_status, meeting_start_at, error
 """
 
@@ -91,7 +97,7 @@ def stats() -> dict[str, Any]:
             COUNT(*) FILTER (WHERE lead_status = 'warm')         AS warm,
             COUNT(*) FILTER (WHERE lead_status = 'cold')         AS cold,
             COUNT(*) FILTER (WHERE error IS NOT NULL)            AS errored,
-            COUNT(*) FILTER (WHERE crm_synced)                   AS crm_synced
+            COUNT(*) FILTER (WHERE crm_synced)                   AS lead_persisted
         FROM agent_runs
         """
     )
@@ -139,6 +145,29 @@ def runs(
         "offset": offset,
         "items": items,
     }
+
+
+@router.patch("/runs/{session_id}", dependencies=[Depends(require_token)])
+def update_run(session_id: str, update: LeadUpdate) -> dict[str, Any]:
+    """Update local lead state without requiring an external CRM."""
+    fields, params = [], []
+    if update.lead_status is not None:
+        fields.append("lead_status = %s")
+        params.append(update.lead_status)
+    if update.handoff_requested is not None:
+        fields.append("handoff_requested = %s")
+        params.append(update.handoff_requested)
+    if not fields:
+        raise HTTPException(400, "no update fields supplied")
+    params.append(session_id)
+    rows = _rows(
+        f"UPDATE agent_runs SET {', '.join(fields)} WHERE session_id = %s "
+        "RETURNING session_id, lead_status, handoff_requested",
+        tuple(params),
+    )
+    if not rows:
+        raise HTTPException(404, "no such session")
+    return rows[0]
 
 
 @router.get("/runs/{session_id}", dependencies=[Depends(require_token)])
